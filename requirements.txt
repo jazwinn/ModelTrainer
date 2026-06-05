@@ -1,0 +1,26 @@
+# UI
+qtpy>=2.4.1
+PyQt5>=5.15.9
+
+# Media processing
+opencv-python>=4.9.0
+ffmpeg-python>=0.2.0
+numpy>=1.26.0
+Pillow>=10.2.0
+
+# Deep learning runtime
+torch>=2.2.0
+torchvision>=0.17.0
+
+# SAM 3 / SAM 3.1 (concept segmentation)
+# SAM 3 is only available in transformers v5+ (Sam3Model / Sam3Processor).
+# If `pip install -U transformers` doesn't yet ship it, install from source:
+#   pip install "git+https://github.com/huggingface/transformers.git"
+transformers>=5.0.0
+accelerate>=0.28.0
+
+# YOLO detection + training
+ultralytics>=8.2.0
+
+# Misc
+pyyaml>=6.0.1
