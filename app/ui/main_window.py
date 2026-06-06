@@ -519,7 +519,7 @@ class MainWindow(QMainWindow):
 
     def _build_panel(self) -> None:
         self._panel_stack = QStackedWidget()
-        self._panel_stack.setFixedWidth(240)
+        self._panel_stack.setFixedWidth(270)
         self._panel_stack.setStyleSheet(
             f"QStackedWidget {{ background: {_PANEL}; "
             f"border-right: 1px solid {_BORDER}; }}"
@@ -599,7 +599,7 @@ class MainWindow(QMainWindow):
         inner = QWidget()
         inner.setStyleSheet(f"background: {_PANEL};")
         v = QVBoxLayout(inner)
-        v.setContentsMargins(16, 16, 12, 16)
+        v.setContentsMargins(16, 16, 16, 16)
         v.setSpacing(5)
 
         # ── Active class (always at top) ──────────────────────────
