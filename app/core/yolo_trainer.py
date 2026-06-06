@@ -88,6 +88,7 @@ class YOLOTrainWorker(QThread):
                 name=self.name,
                 exist_ok=True,
                 verbose=False,
+                # device auto-detects GPU if available, falls back to CPU
                 batch=-1,     # Auto-batch to maximize VRAM usage
                 cache=True,   # Cache dataset in RAM to prevent disk bottlenecks
                 workers=8,    # Increase dataloader workers

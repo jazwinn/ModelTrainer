@@ -53,7 +53,8 @@ class FrameAnnotation:
     frame_index: int
     image_path: str
     boxes: list[BBox] = field(default_factory=list)
-    status: str = "pending"  # "pending" | "verified" | "exported"
+    status: str = "pending"   # "pending" | "verified" | "exported"
+    source_video: str = ""    # absolute path of the source video (empty for still images)
 
 
 AnnotationStore = dict[int, FrameAnnotation]

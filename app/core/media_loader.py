@@ -46,10 +46,16 @@ class MediaLoaderWorker(QThread):
     Scans source_paths (files or a single directory), decodes every image and
     video frame, saves PNGs to output_dir/frames/, and emits frame_ready for
     each one so the UI can populate the thumbnail list progressively.
+
+    import_stride controls video frame skipping: stride=5 means only every 5th
+    raw video frame is kept (frames 0, 5, 10, …).  Images are never skipped.
+
+    frame_offset shifts the first emitted frame_index so that appending to an
+    existing session doesn't overwrite already-loaded frames.
     """
 
-    frame_ready = Signal(int, str)   # (frame_index, png_path)
-    progress    = Signal(int, int)   # (current, total)
+    frame_ready = Signal(int, str, str)  # (frame_index, png_path, source_path)
+    progress    = Signal(int, int)       # (current, total)
     finished    = Signal()
     error       = Signal(str)
 
@@ -57,11 +63,15 @@ class MediaLoaderWorker(QThread):
         self,
         source_paths: list[str],
         output_dir: str,
+        import_stride: int = 1,
+        frame_offset: int = 0,
         parent=None,
     ):
         super().__init__(parent)
         self.source_paths = source_paths
         self.output_dir = output_dir
+        self.import_stride = max(1, import_stride)
+        self.frame_offset = max(0, frame_offset)
         self._abort = False
 
     def abort(self) -> None:
@@ -72,12 +82,14 @@ class MediaLoaderWorker(QThread):
     # ------------------------------------------------------------------
 
     def _total_frames(self, media: list[str]) -> int:
+        import math
         total = 0
         for p in media:
             if _classify(p) == "image":
                 total += 1
             else:
-                total += _video_frame_count(p)
+                raw = _video_frame_count(p)
+                total += math.ceil(raw / self.import_stride)
         return total
 
     def _emit_image(self, path: str, frame_index: int, frames_dir: str) -> int:
@@ -89,21 +101,26 @@ class MediaLoaderWorker(QThread):
             img = _cv2.imread(path)
             if img is not None:
                 _cv2.imwrite(dst, img)
-        self.frame_ready.emit(frame_index, dst)
+        # Pass original path as source so callers can match label files by stem
+        self.frame_ready.emit(frame_index, dst, path)
         return frame_index + 1
 
     def _emit_video(self, path: str, frame_index: int, frames_dir: str) -> int:
+        """Decode video, keeping only every import_stride-th raw frame."""
         cap = cv2.VideoCapture(path)
+        raw_idx = 0
         while True:
             if self._abort:
                 break
             ret, frame = cap.read()
             if not ret:
                 break
-            dst = os.path.join(frames_dir, f"frame_{frame_index:06d}.png")
-            cv2.imwrite(dst, frame)
-            self.frame_ready.emit(frame_index, dst)
-            frame_index += 1
+            if raw_idx % self.import_stride == 0:
+                dst = os.path.join(frames_dir, f"frame_{frame_index:06d}.png")
+                cv2.imwrite(dst, frame)
+                self.frame_ready.emit(frame_index, dst, path)  # path = source video
+                frame_index += 1
+            raw_idx += 1
         cap.release()
         return frame_index
 
@@ -129,7 +146,7 @@ class MediaLoaderWorker(QThread):
             return
 
         total = self._total_frames(media)
-        frame_index = 0
+        frame_index = self.frame_offset
 
         for path in media:
             if self._abort:
@@ -143,6 +160,6 @@ class MediaLoaderWorker(QThread):
             except Exception as exc:
                 self.error.emit(f"Error loading {os.path.basename(path)}: {exc}")
 
-            self.progress.emit(frame_index, total)
+            self.progress.emit(frame_index - self.frame_offset, total)
 
         self.finished.emit()
