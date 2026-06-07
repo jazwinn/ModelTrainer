@@ -25,6 +25,11 @@ from __future__ import annotations
 import os
 import tempfile
 
+# Project root — two directories above this file (app/ui/ → app/ → project root)
+_APP_ROOT = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+)
+
 from qtpy.QtCore import Qt, QSize, Slot
 from qtpy.QtGui import QColor, QPalette, QIcon, QPixmap, QImage, QFont
 from qtpy.QtWidgets import (
@@ -60,7 +65,10 @@ from app.core.sam3_handler import (
     SAM3TextWorker, SAM3LoadWorker, SAM3PromptWorker, SAM3TrackWorker, SAM_MODELS,
 )
 from app.core.media_loader import MediaLoaderWorker
-from app.core.yolo_trainer import YOLOTrainWorker, MODEL_REGISTRY
+from app.core.yolo_trainer import (
+    YOLOTrainWorker, MODEL_REGISTRY,
+    DETECTION_MODELS, SEGMENTATION_MODELS,
+)
 from app.ui.canvas import AnnotationCanvas
 from app.utils.yolo_exporter import export_dataset
 
@@ -253,6 +261,7 @@ class MainWindow(QMainWindow):
         # Active workers
         self._media_worker: MediaLoaderWorker | None = None
         self._train_worker: YOLOTrainWorker | None = None
+        self._seg_converter_worker = None
 
         # SAM 3 state
         self._sam_load_worker: SAM3LoadWorker | None = None
@@ -431,8 +440,13 @@ class MainWindow(QMainWindow):
         self._act_export.setEnabled(False)
         self._act_export.triggered.connect(self._on_export)
 
+        self._task_combo = QComboBox()
+        self._task_combo.addItems(["Detection", "Segmentation"])
+        self._task_combo.setStyleSheet(_combo_css())
+        self._task_combo.currentIndexChanged.connect(self._on_task_changed)
+
         self._model_combo = QComboBox()
-        self._model_combo.addItems(list(MODEL_REGISTRY.keys()))
+        self._model_combo.addItems(DETECTION_MODELS)
         self._model_combo.setStyleSheet(_combo_css())
 
         self._epoch_spin = QSpinBox()
@@ -444,6 +458,13 @@ class MainWindow(QMainWindow):
         self._act_train.setToolTip("Train the selected YOLO model on exported annotations")
         self._act_train.setEnabled(True)   # always available — picks data.yaml folder at runtime
         self._act_train.triggered.connect(self._on_train)
+
+        self._act_convert = QAction("⬡  Convert to Segmentation", self)
+        self._act_convert.setToolTip(
+            "Upgrade a YOLO detection dataset (bounding boxes) to instance segmentation\n"
+            "polygon masks using SAM 3 — no re-labeling required."
+        )
+        self._act_convert.triggered.connect(self._on_convert_to_seg)
 
     # ──────────────────────────────────────────────────────────────
     # Header bar
@@ -679,7 +700,19 @@ class MainWindow(QMainWindow):
         v.addWidget(hint_e)
         v.addWidget(_hr())
 
+        v.addWidget(_section_lbl("Convert to Segmentation"))
+        v.addWidget(_tool_btn(self._act_convert, _css_primary("#7c3aed", hover="#6d28d9")))
+        hint_c = QLabel(
+            "Converts a detection dataset\n(bboxes) → polygon masks\nusing SAM 3."
+        )
+        hint_c.setStyleSheet(f"color: {_MUTED}; font-size: 10px; padding: 4px 0 0 0;")
+        hint_c.setWordWrap(True)
+        v.addWidget(hint_c)
+        v.addWidget(_hr())
+
         v.addWidget(_section_lbl("Training"))
+        v.addLayout(_row_layout("Task:", self._task_combo))
+        v.addSpacing(4)
         v.addLayout(_row_layout("Model:", self._model_combo))
         v.addSpacing(4)
         v.addLayout(_row_layout("Epochs:", self._epoch_spin))
@@ -810,7 +843,7 @@ class MainWindow(QMainWindow):
     def _on_import(self) -> None:
         """Fresh import — clears all existing frames and annotations."""
         path = QFileDialog.getExistingDirectory(
-            self, "Select Media Directory", os.path.expanduser("~")
+            self, "Select Media Directory", _APP_ROOT
         )
         if not path:
             return
@@ -832,7 +865,7 @@ class MainWindow(QMainWindow):
     def _on_add_more(self) -> None:
         """Append more images/videos without clearing the existing session."""
         path = QFileDialog.getExistingDirectory(
-            self, "Select Media Directory to Append", os.path.expanduser("~")
+            self, "Select Media Directory to Append", _APP_ROOT
         )
         if not path:
             return
@@ -846,7 +879,7 @@ class MainWindow(QMainWindow):
     def _on_import_dataset(self) -> None:
         """Import a YOLO-format dataset folder (images/ + labels/ + data.yaml)."""
         path = QFileDialog.getExistingDirectory(
-            self, "Select YOLO Dataset Folder", os.path.expanduser("~")
+            self, "Select YOLO Dataset Folder", _APP_ROOT
         )
         if not path:
             return
@@ -1077,7 +1110,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_export(self) -> None:
         out_dir = QFileDialog.getExistingDirectory(
-            self, "Select Export Directory", os.path.expanduser("~")
+            self, "Select Export Directory", _APP_ROOT
         )
         if not out_dir:
             return
@@ -1086,10 +1119,18 @@ class MainWindow(QMainWindow):
         self._update_thumbnail_colors()
         self._act_train.setEnabled(count > 0)
 
+    @Slot(int)
+    def _on_task_changed(self, index: int) -> None:
+        self._model_combo.clear()
+        if index == 0:
+            self._model_combo.addItems(DETECTION_MODELS)
+        else:
+            self._model_combo.addItems(SEGMENTATION_MODELS)
+
     @Slot()
     def _on_train(self) -> None:
         out_dir = QFileDialog.getExistingDirectory(
-            self, "Select Dataset Directory (containing data.yaml)", os.path.expanduser("~")
+            self, "Select Dataset Directory (containing data.yaml)", _APP_ROOT
         )
         if not out_dir:
             return
@@ -1112,12 +1153,40 @@ class MainWindow(QMainWindow):
             return
 
         model_key = self._model_combo.currentText()
+        is_seg_model = model_key.endswith("-seg")
+
+        # Dataset compatibility check
+        try:
+            import yaml as _yaml
+            with open(yaml_path, encoding="utf-8") as _f:
+                _yd = _yaml.safe_load(_f)
+            dataset_task = (_yd or {}).get("task", "detect")
+        except Exception:
+            dataset_task = "detect"
+
+        is_seg_dataset = dataset_task == "segment"
+
+        if is_seg_model and not is_seg_dataset:
+            reply = QMessageBox.warning(
+                self, "Dataset Mismatch",
+                f"'{model_key}' is a segmentation model, but the selected dataset "
+                f"does not have 'task: segment' in its data.yaml.\n\n"
+                f"Segmentation training requires polygon-mask labels. "
+                f"Use 'Convert to Segmentation' to upgrade a detection dataset first.\n\n"
+                f"Proceed anyway?",
+                QMessageBox.Ok | QMessageBox.Cancel,
+            )
+            if reply == QMessageBox.Cancel:
+                return
+
         epochs = self._epoch_spin.value()
+        metric_label = "mAP50-mask" if is_seg_model else "mAP50"
 
         self._status_label.setText(f"Training {model_key} for {epochs} epochs…")
         self._progress.setRange(0, epochs)
         self._progress.setValue(0)
         self._act_train.setEnabled(False)
+        self._train_metric_label = metric_label
 
         self._train_worker = YOLOTrainWorker(
             model_key=model_key,
@@ -1128,6 +1197,75 @@ class MainWindow(QMainWindow):
         self._train_worker.finished.connect(self._on_train_finished)
         self._train_worker.error.connect(self._on_worker_error)
         self._train_worker.start()
+
+    # ──────────────────────────────────────────────────────────────
+    # Segmentation converter
+    # ──────────────────────────────────────────────────────────────
+
+    @Slot()
+    def _on_convert_to_seg(self) -> None:
+        source_dir = QFileDialog.getExistingDirectory(
+            self, "Select Detection Dataset (contains data.yaml)",
+            _APP_ROOT
+        )
+        if not source_dir:
+            return
+
+        # Output is a sibling folder named <source_folder>seg
+        source_path = os.path.normpath(source_dir)
+        parent_dir = os.path.dirname(source_path)
+        folder_name = os.path.basename(source_path)
+        output_dir = os.path.join(parent_dir, folder_name + "seg")
+
+        if self._seg_converter_worker and self._seg_converter_worker.isRunning():
+            return
+
+        from app.core.yolo_seg_converter import YoloSegConverterWorker
+
+        self._status_label.setText("Starting segmentation conversion…")
+        self._progress.setRange(0, 0)
+
+        # Reuse already-loaded SAM 3 model if available — avoids a second load
+        preloaded_model     = self._sam_model_obj
+        preloaded_processor = self._sam_processor_obj
+
+        self._seg_converter_worker = YoloSegConverterWorker(
+            source_root=source_dir,
+            output_root=output_dir,
+            model=preloaded_model,
+            processor=preloaded_processor,
+        )
+        self._seg_converter_worker.progress.connect(self._on_seg_convert_progress)
+        self._seg_converter_worker.status_update.connect(self._status_label.setText)
+        self._seg_converter_worker.finished.connect(self._on_seg_convert_finished)
+        self._seg_converter_worker.error.connect(self._on_worker_error)
+        self._seg_converter_worker.start()
+
+    @Slot(int, int)
+    def _on_seg_convert_progress(self, current: int, total: int) -> None:
+        if total > 0:
+            self._progress.setRange(0, total)
+            self._progress.setValue(current)
+            pct = int(current / total * 100)
+            self._status_label.setText(
+                f"Converting: {pct}%  ({current}/{total} images)"
+            )
+
+    @Slot(dict)
+    def _on_seg_convert_finished(self, result: dict) -> None:
+        self._progress.setRange(0, 100)
+        self._progress.setValue(100)
+        summary = (
+            f"Conversion complete — {result['converted_items']} SAM 3 masks, "
+            f"{result['fallback_items']} bbox fallback, "
+            f"{result['failed_items']} failed  "
+            f"({result['time_taken_sec']:.1f}s)"
+        )
+        self._status_label.setText(summary)
+        QMessageBox.information(
+            self, "Conversion Complete",
+            f"{summary}\n\nOutput: {result['output_dir']}"
+        )
 
     # ──────────────────────────────────────────────────────────────
     # Worker slots — media loader
@@ -1185,6 +1323,9 @@ class MainWindow(QMainWindow):
         if self._pending_labels_dir and os.path.isdir(self._pending_labels_dir):
             labeled = self._apply_dataset_labels(self._pending_labels_dir)
             self._pending_labels_dir = None
+            # Reload canvas so boxes appear without requiring a click
+            if self.current_frame_index is not None:
+                self._reload_canvas(self.current_frame_index)
             self._status_label.setText(
                 f"Imported {count} frame(s), loaded labels for {labeled} ✓"
             )
@@ -1223,19 +1364,34 @@ class MainWindow(QMainWindow):
             with open(label_path, encoding="utf-8") as f:
                 for line in f:
                     parts = line.strip().split()
-                    if len(parts) != 5:
+                    if not parts:
                         continue
                     try:
                         cid = int(parts[0])
-                        cx, cy, bw, bh = (float(p) for p in parts[1:])
+                        floats = [float(p) for p in parts[1:]]
                     except ValueError:
                         continue
-                    x1 = (cx - bw / 2) * w
-                    y1 = (cy - bh / 2) * h
-                    x2 = (cx + bw / 2) * w
-                    y2 = (cy + bh / 2) * h
-                    boxes.append(BBox(x1=x1, y1=y1, x2=x2, y2=y2,
-                                      class_id=cid, source="dataset"))
+
+                    # Segmentation format: class_id + even number of xy pairs (≥3 pts)
+                    if len(floats) >= 6 and len(floats) % 2 == 0:
+                        xs = floats[0::2]
+                        ys = floats[1::2]
+                        x1 = min(xs) * w
+                        y1 = min(ys) * h
+                        x2 = max(xs) * w
+                        y2 = max(ys) * h
+                        boxes.append(BBox(x1=x1, y1=y1, x2=x2, y2=y2,
+                                          class_id=cid, source="dataset",
+                                          polygon=floats))
+                    elif len(floats) == 4:
+                        # Detection format: cx cy w h
+                        cx, cy, bw, bh = floats
+                        x1 = (cx - bw / 2) * w
+                        y1 = (cy - bh / 2) * h
+                        x2 = (cx + bw / 2) * w
+                        y2 = (cy + bh / 2) * h
+                        boxes.append(BBox(x1=x1, y1=y1, x2=x2, y2=y2,
+                                          class_id=cid, source="dataset"))
             if boxes:
                 ann.boxes = boxes
                 ann.status = "verified"
@@ -1557,7 +1713,8 @@ class MainWindow(QMainWindow):
     @Slot(int, int, float)
     def _on_epoch_done(self, epoch: int, total: int, map50: float) -> None:
         self._progress.setValue(epoch)
-        self._status_label.setText(f"Epoch {epoch}/{total}  —  mAP50: {map50:.4f}")
+        metric = getattr(self, "_train_metric_label", "mAP50")
+        self._status_label.setText(f"Epoch {epoch}/{total}  —  {metric}: {map50:.4f}")
 
     @Slot(str)
     def _on_train_finished(self, best_weights: str) -> None:
@@ -1674,6 +1831,7 @@ class MainWindow(QMainWindow):
             self._media_worker, self._train_worker,
             self._sam_load_worker, self._sam_text_worker,
             self._sam_prompt_worker, self._sam_track_worker,
+            self._seg_converter_worker,
         ):
             if worker and worker.isRunning():
                 if hasattr(worker, "abort"):

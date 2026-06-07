@@ -14,11 +14,12 @@ Supports:
 from __future__ import annotations
 
 from qtpy.QtCore import Qt, QRectF, QPointF, Signal
-from qtpy.QtGui import QColor, QPen, QBrush, QPixmap, QCursor, QPainter
+from qtpy.QtGui import QColor, QPen, QBrush, QPixmap, QCursor, QPainter, QPolygonF
 from qtpy.QtWidgets import (
     QGraphicsView,
     QGraphicsScene,
     QGraphicsRectItem,
+    QGraphicsPolygonItem,
     QGraphicsEllipseItem,
     QGraphicsPixmapItem,
     QApplication,
@@ -27,12 +28,13 @@ from qtpy.QtWidgets import (
 from app.core.sam3_handler import BBox
 
 # Visual constants
-HANDLE_SIZE     = 8.0
-HANDLE_COLOR    = QColor(255, 220, 0)
-BOX_COLOR_SAM   = QColor(0, 180, 255, 180)
+HANDLE_SIZE      = 8.0
+HANDLE_COLOR     = QColor(255, 220, 0)
+BOX_COLOR_SAM    = QColor(0, 180, 255, 180)
 BOX_COLOR_MANUAL = QColor(0, 255, 120, 180)
-BOX_SEL_COLOR   = QColor(255, 200, 0, 220)
-BOX_THICKNESS   = 2
+BOX_SEL_COLOR    = QColor(255, 200, 0, 220)
+BOX_THICKNESS    = 2
+POLY_COLOR       = QColor(255, 80, 160, 180)  # magenta — segmentation polygons
 
 _HANDLES = [
     "tl", "tm", "tr",
@@ -133,6 +135,29 @@ class AnnotationRect(QGraphicsRectItem):
 
 
 # ---------------------------------------------------------------------------
+# Segmentation polygon overlay (read-only, non-interactive)
+# ---------------------------------------------------------------------------
+
+class SegPolygonItem(QGraphicsPolygonItem):
+    """Renders a normalized segmentation polygon scaled to image pixel coords."""
+
+    def __init__(self, bbox: BBox, img_w: int, img_h: int):
+        coords = bbox.polygon  # flat [x1,y1,x2,y2,...] in 0–1 range
+        pts = [
+            QPointF(coords[i] * img_w, coords[i + 1] * img_h)
+            for i in range(0, len(coords) - 1, 2)
+        ]
+        super().__init__(QPolygonF(pts))
+        self.bbox = bbox
+        self.setPen(QPen(POLY_COLOR, BOX_THICKNESS))
+        fill = QColor(POLY_COLOR.red(), POLY_COLOR.green(), POLY_COLOR.blue(), 45)
+        self.setBrush(QBrush(fill))
+        self.setFlag(QGraphicsPolygonItem.ItemIsMovable, False)
+        self.setFlag(QGraphicsPolygonItem.ItemIsSelectable, False)
+        self.setZValue(1)
+
+
+# ---------------------------------------------------------------------------
 # Canvas
 # ---------------------------------------------------------------------------
 
@@ -204,7 +229,10 @@ class AnnotationCanvas(QGraphicsView):
         self._scene.setSceneRect(QRectF(pixmap.rect()))
 
         for bbox in boxes:
-            self._add_rect_item(bbox)
+            if bbox.polygon:
+                self._add_polygon_item(bbox)
+            else:
+                self._add_rect_item(bbox)
 
         self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
 
@@ -270,6 +298,14 @@ class AnnotationCanvas(QGraphicsView):
         item = AnnotationRect(bbox, r)
         self._scene.addItem(item)
         self._annotation_rects.append(item)
+        return item
+
+    def _add_polygon_item(self, bbox: BBox) -> SegPolygonItem:
+        sr = self._scene.sceneRect()
+        img_w = int(sr.width())
+        img_h = int(sr.height())
+        item = SegPolygonItem(bbox, img_w, img_h)
+        self._scene.addItem(item)
         return item
 
     def _select(self, item: AnnotationRect | None) -> None:

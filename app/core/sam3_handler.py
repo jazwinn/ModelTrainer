@@ -36,16 +36,19 @@ class BBox:
     x2: float
     y2: float
     class_id: int = 0
-    source: str = "sam"  # "sam" | "manual"
+    source: str = "sam"  # "sam" | "manual" | "dataset"
+    polygon: list[float] | None = None  # flat [x1,y1,...] normalized 0–1 for seg labels
 
     def to_dict(self) -> dict:
         return {"x1": self.x1, "y1": self.y1, "x2": self.x2, "y2": self.y2,
-                "class_id": self.class_id, "source": self.source}
+                "class_id": self.class_id, "source": self.source,
+                "polygon": self.polygon}
 
     @staticmethod
     def from_dict(d: dict) -> "BBox":
         return BBox(x1=d["x1"], y1=d["y1"], x2=d["x2"], y2=d["y2"],
-                    class_id=d.get("class_id", 0), source=d.get("source", "sam"))
+                    class_id=d.get("class_id", 0), source=d.get("source", "sam"),
+                    polygon=d.get("polygon"))
 
 
 @dataclass
@@ -162,7 +165,13 @@ def _run_sam3(
         return []  # nothing to segment
 
     inputs = processor(**proc_kwargs)
-    inputs = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in inputs.items()}
+    # Move to device; only convert float tensors to model's dtype (keep integers as-is)
+    model_dtype = next(model.parameters()).dtype
+    inputs = {
+        k: (v.to(device, dtype=model_dtype) if hasattr(v, "to") and v.dtype.is_floating_point else
+            v.to(device) if hasattr(v, "to") else v)
+        for k, v in inputs.items()
+    }
 
     with torch.inference_mode():
         outputs = model(**inputs)
@@ -213,7 +222,13 @@ def _run_sam3_batch_text(
 
     # SAM 3 processor accepts a list of lists of strings for batched text
     inputs = processor(images=pil_img, text=[texts], return_tensors="pt")
-    inputs = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in inputs.items()}
+    # Move to device; only convert float tensors to model's dtype (keep integers as-is)
+    model_dtype = next(model.parameters()).dtype
+    inputs = {
+        k: (v.to(device, dtype=model_dtype) if hasattr(v, "to") and v.dtype.is_floating_point else
+            v.to(device) if hasattr(v, "to") else v)
+        for k, v in inputs.items()
+    }
 
     with torch.inference_mode():
         outputs = model(**inputs)
