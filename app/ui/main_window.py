@@ -1152,8 +1152,9 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "PyTorch Error", str(exc))
             return
 
+        from app.core.yolo_trainer import _is_seg_key
         model_key = self._model_combo.currentText()
-        is_seg_model = model_key.endswith("-seg")
+        is_seg_model = _is_seg_key(model_key)
 
         # Dataset compatibility check
         try:

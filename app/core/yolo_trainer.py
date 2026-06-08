@@ -50,6 +50,9 @@ MODEL_REGISTRY: dict[str, str] = {
     "YOLO26s-seg":   "yolo26s-seg.yaml",
     "YOLO26m-seg":   "yolo26m-seg.yaml",
     "YOLO26l-seg":   "yolo26l-seg.yaml",
+    # FastSAM — pretrained segmentation checkpoints (always seg-only).
+    "FastSAM-s":     "FastSAM-s.pt",
+    "FastSAM-x":     "FastSAM-x.pt",
 }
 
 # For seg models built from a .yaml (no pretrained seg weights), transfer the
@@ -66,8 +69,12 @@ SEG_TRANSFER_BASE: dict[str, str] = {
     "YOLO26l-seg": "yolo26l.pt",
 }
 
-DETECTION_MODELS:    list[str] = [k for k in MODEL_REGISTRY if not k.endswith("-seg")]
-SEGMENTATION_MODELS: list[str] = [k for k in MODEL_REGISTRY if k.endswith("-seg")]
+# Keys that are segmentation models (ends with -seg OR is a FastSAM variant)
+def _is_seg_key(key: str) -> bool:
+    return key.endswith("-seg") or key.startswith("FastSAM")
+
+DETECTION_MODELS:    list[str] = [k for k in MODEL_REGISTRY if not _is_seg_key(k)]
+SEGMENTATION_MODELS: list[str] = [k for k in MODEL_REGISTRY if _is_seg_key(k)]
 
 
 class YOLOTrainWorker(QThread):
@@ -103,7 +110,7 @@ class YOLOTrainWorker(QThread):
         self.project       = project
         self.name          = name
         self._total_epochs = epochs
-        self._is_seg       = model_key.endswith("-seg")
+        self._is_seg       = _is_seg_key(model_key)
 
     def _build_model(self, YOLO):
         """Construct the YOLO model for self.model_key.
