@@ -76,6 +76,10 @@ def _is_seg_key(key: str) -> bool:
 DETECTION_MODELS:    list[str] = [k for k in MODEL_REGISTRY if not _is_seg_key(k)]
 SEGMENTATION_MODELS: list[str] = [k for k in MODEL_REGISTRY if _is_seg_key(k)]
 
+# SAM 2 keys are handled by sam2_trainer; re-exported here for convenience.
+def _is_sam2_key(key: str) -> bool:
+    return key.startswith("SAM 2")
+
 
 class YOLOTrainWorker(QThread):
     """

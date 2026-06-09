@@ -68,7 +68,9 @@ from app.core.media_loader import MediaLoaderWorker
 from app.core.yolo_trainer import (
     YOLOTrainWorker, MODEL_REGISTRY,
     DETECTION_MODELS, SEGMENTATION_MODELS,
+    _is_sam2_key,
 )
+from app.core.sam2_trainer import SAM2TrainWorker, SAM2_MODELS
 from app.ui.canvas import AnnotationCanvas
 from app.utils.yolo_exporter import export_dataset
 
@@ -261,6 +263,7 @@ class MainWindow(QMainWindow):
         # Active workers
         self._media_worker: MediaLoaderWorker | None = None
         self._train_worker: YOLOTrainWorker | None = None
+        self._sam2_train_worker: SAM2TrainWorker | None = None
         self._seg_converter_worker = None
 
         # SAM 3 state
@@ -719,7 +722,8 @@ class MainWindow(QMainWindow):
         v.addSpacing(8)
         v.addWidget(_tool_btn(self._act_train, _css_primary(_GREEN, hover="#059669")))
         hint_t = QLabel(
-            "Point to your exported dataset\nfolder (contains data.yaml)."
+            "YOLO / FastSAM: point to your\nexported dataset folder.\n"
+            "SAM 2: trains directly from\nyour annotations — no export."
         )
         hint_t.setStyleSheet(f"color: {_MUTED}; font-size: 10px; padding: 4px 0 0 0;")
         hint_t.setWordWrap(True)
@@ -1114,8 +1118,10 @@ class MainWindow(QMainWindow):
         )
         if not out_dir:
             return
-        count = export_dataset(self.store, self.class_names, out_dir)
-        self._status_label.setText(f"Exported {count} frames to {out_dir}")
+        is_seg = self._task_combo.currentIndex() != 0  # index 0 = Detection
+        count = export_dataset(self.store, self.class_names, out_dir, is_seg=is_seg)
+        task_label = "segmentation" if is_seg else "detection"
+        self._status_label.setText(f"Exported {count} frames ({task_label}) to {out_dir}")
         self._update_thumbnail_colors()
         self._act_train.setEnabled(count > 0)
 
@@ -1125,10 +1131,20 @@ class MainWindow(QMainWindow):
         if index == 0:
             self._model_combo.addItems(DETECTION_MODELS)
         else:
+            # YOLO-based seg models first, then SAM 2 variants
             self._model_combo.addItems(SEGMENTATION_MODELS)
+            self._model_combo.addItems(list(SAM2_MODELS.keys()))
 
     @Slot()
     def _on_train(self) -> None:
+        model_key = self._model_combo.currentText()
+
+        # ── SAM 2 fine-tuning (trains directly from annotation store) ──
+        if _is_sam2_key(model_key):
+            self._on_train_sam2(model_key)
+            return
+
+        # ── YOLO / FastSAM training (requires exported data.yaml) ──
         out_dir = QFileDialog.getExistingDirectory(
             self, "Select Dataset Directory (containing data.yaml)", _APP_ROOT
         )
@@ -1153,7 +1169,6 @@ class MainWindow(QMainWindow):
             return
 
         from app.core.yolo_trainer import _is_seg_key
-        model_key = self._model_combo.currentText()
         is_seg_model = _is_seg_key(model_key)
 
         # Dataset compatibility check
@@ -1198,6 +1213,58 @@ class MainWindow(QMainWindow):
         self._train_worker.finished.connect(self._on_train_finished)
         self._train_worker.error.connect(self._on_worker_error)
         self._train_worker.start()
+
+    def _on_train_sam2(self, model_key: str) -> None:
+        """Start SAM 2 fine-tuning on the current annotation store."""
+        if self._sam2_train_worker and self._sam2_train_worker.isRunning():
+            return
+
+        # Check that we have annotated frames to train on
+        annotated = [a for a in self.store.values() if a.boxes]
+        if not annotated:
+            QMessageBox.information(
+                self, "SAM 2 Training",
+                "No annotated frames found.\n\n"
+                "Annotate at least a few frames with bounding boxes or "
+                "SAM 3 masks before fine-tuning SAM 2."
+            )
+            return
+
+        try:
+            import torch  # noqa: F401
+        except Exception as exc:
+            QMessageBox.critical(self, "PyTorch Error", str(exc))
+            return
+
+        # Pick output directory
+        output_dir = QFileDialog.getExistingDirectory(
+            self, "Select Output Directory for SAM 2 Checkpoint", _APP_ROOT
+        )
+        if not output_dir:
+            return
+
+        epochs = self._epoch_spin.value()
+        sample_count = sum(len(a.boxes) for a in annotated)
+
+        self._status_label.setText(
+            f"Fine-tuning {model_key} for {epochs} epochs "
+            f"on {sample_count} annotated boxes…"
+        )
+        self._progress.setRange(0, epochs)
+        self._progress.setValue(0)
+        self._act_train.setEnabled(False)
+        self._train_metric_label = "loss"
+
+        self._sam2_train_worker = SAM2TrainWorker(
+            model_key=model_key,
+            store=self.store,
+            epochs=epochs,
+            output_dir=output_dir,
+        )
+        self._sam2_train_worker.epoch_done.connect(self._on_epoch_done)
+        self._sam2_train_worker.finished.connect(self._on_sam2_train_finished)
+        self._sam2_train_worker.error.connect(self._on_sam2_train_error)
+        self._sam2_train_worker.start()
 
     # ──────────────────────────────────────────────────────────────
     # Segmentation converter
@@ -1728,6 +1795,26 @@ class MainWindow(QMainWindow):
             f"Training finished.\n\nBest weights:\n"
             f"{best_weights or 'runs/train/exp/weights/best.pt'}"
         )
+
+    @Slot(str)
+    def _on_sam2_train_finished(self, save_dir: str) -> None:
+        self._status_label.setText(f"SAM 2 fine-tuning complete ✓  Saved: {save_dir}")
+        self._progress.setValue(self._progress.maximum())
+        self._act_train.setEnabled(True)
+        QMessageBox.information(
+            self, "SAM 2 Fine-tuning Complete",
+            f"Fine-tuning finished.\n\n"
+            f"Model checkpoint saved to:\n{save_dir}\n\n"
+            f"Load it with:\n"
+            f"  Sam2Model.from_pretrained('{save_dir}')\n"
+            f"  Sam2Processor.from_pretrained('{save_dir}')"
+        )
+
+    @Slot(str)
+    def _on_sam2_train_error(self, msg: str) -> None:
+        self._status_label.setText(f"SAM 2 training error: {msg[:80]}")
+        self._act_train.setEnabled(True)
+        QMessageBox.warning(self, "SAM 2 Training Error", msg)
 
     # ──────────────────────────────────────────────────────────────
     # Shared error handler
