@@ -88,37 +88,109 @@ def _focal_dice_loss(pred_logits, gt_mask, focal_alpha: float = 0.25,
 # Dataset helpers
 # ---------------------------------------------------------------------------
 
-def _bbox_to_mask(bbox, img_w: int, img_h: int) -> np.ndarray:
-    """Rasterise *bbox* to a (H, W) float32 binary mask.
+def _label_to_mask_and_box(
+    parts: list[str], img_w: int, img_h: int
+) -> tuple[list[float], np.ndarray] | None:
+    """Parse one YOLO label line and return (box_xyxy, mask).
 
-    Uses the polygon stored on the box when available; falls back to a
-    filled axis-aligned rectangle otherwise.
+    Handles both formats exported by this app:
+      • Detection:    class cx cy w h          (5 values)
+      • Segmentation: class x1 y1 x2 y2 …     (≥7 values, polygon points)
+
+    Returns None if the line is malformed or produces a degenerate mask.
     """
-    import cv2  # already required by the rest of the app
+    import cv2
+
+    if len(parts) < 5:
+        return None
+    try:
+        values = [float(p) for p in parts[1:]]  # skip class_id
+    except ValueError:
+        return None
 
     mask = np.zeros((img_h, img_w), dtype=np.float32)
 
-    if bbox.polygon:
-        pts = np.array(bbox.polygon, dtype=np.float32).reshape(-1, 2)
-        pts[:, 0] *= img_w
-        pts[:, 1] *= img_h
-        cv2.fillPoly(mask, [pts.astype(np.int32)], 1.0)
+    if len(values) == 4:
+        # Detection format: cx cy w h  (normalised)
+        cx, cy, w, h = values
+        x1 = (cx - w / 2) * img_w
+        y1 = (cy - h / 2) * img_h
+        x2 = (cx + w / 2) * img_w
+        y2 = (cy + h / 2) * img_h
+        xi1, yi1 = max(0, int(x1)), max(0, int(y1))
+        xi2, yi2 = min(img_w, int(x2)), min(img_h, int(y2))
+        mask[yi1:yi2, xi1:xi2] = 1.0
+        box = [x1, y1, x2, y2]
     else:
-        x1 = max(0, int(bbox.x1))
-        y1 = max(0, int(bbox.y1))
-        x2 = min(img_w, int(bbox.x2))
-        y2 = min(img_h, int(bbox.y2))
-        mask[y1:y2, x1:x2] = 1.0
+        # Segmentation format: x1 y1 x2 y2 … (normalised polygon)
+        pts = np.array(values, dtype=np.float32).reshape(-1, 2)
+        pts_px = pts.copy()
+        pts_px[:, 0] *= img_w
+        pts_px[:, 1] *= img_h
+        cv2.fillPoly(mask, [pts_px.astype(np.int32)], 1.0)
+        # Derive axis-aligned box from polygon extents
+        x1, y1 = float(pts_px[:, 0].min()), float(pts_px[:, 1].min())
+        x2, y2 = float(pts_px[:, 0].max()), float(pts_px[:, 1].max())
+        box = [x1, y1, x2, y2]
 
-    return mask
+    if mask.sum() < 4:
+        return None
+    return box, mask
 
 
-def _collect_samples(
-    store: AnnotationStore,
+def _collect_samples_from_dir(
+    dataset_dir: str,
 ) -> list[tuple[Image.Image, list[float], np.ndarray]]:
-    """Return [(PIL image, [x1,y1,x2,y2], mask_array), …] for all annotations."""
+    """Load (PIL image, box_xyxy, mask) samples from an exported YOLO dataset folder.
+
+    Expects the standard layout written by export_dataset():
+        <dataset_dir>/images/*.png
+        <dataset_dir>/labels/*.txt
+    Handles both detection and segmentation label formats.
+    """
+    images_dir = os.path.join(dataset_dir, "images")
+    labels_dir = os.path.join(dataset_dir, "labels")
+
+    if not os.path.isdir(images_dir) or not os.path.isdir(labels_dir):
+        return []
+
     samples: list[tuple[Image.Image, list[float], np.ndarray]] = []
 
+    for img_name in sorted(os.listdir(images_dir)):
+        stem, ext = os.path.splitext(img_name)
+        if ext.lower() not in (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"):
+            continue
+        img_path = os.path.join(images_dir, img_name)
+        lbl_path = os.path.join(labels_dir, stem + ".txt")
+        if not os.path.isfile(lbl_path):
+            continue
+        try:
+            pil = Image.open(img_path).convert("RGB")
+        except Exception:
+            continue
+        W, H = pil.size
+
+        with open(lbl_path, encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.strip().split()
+                if not parts:
+                    continue
+                result = _label_to_mask_and_box(parts, W, H)
+                if result is None:
+                    continue
+                box, mask = result
+                samples.append((pil, box, mask))
+
+    return samples
+
+
+def _collect_samples_from_store(
+    store: AnnotationStore,
+) -> list[tuple[Image.Image, list[float], np.ndarray]]:
+    """Return samples from the in-memory annotation store (legacy path)."""
+    import cv2
+
+    samples: list[tuple[Image.Image, list[float], np.ndarray]] = []
     for ann in store.values():
         if not ann.boxes or not os.path.isfile(ann.image_path):
             continue
@@ -130,11 +202,19 @@ def _collect_samples(
         for bbox in ann.boxes:
             box  = [float(bbox.x1), float(bbox.y1),
                     float(bbox.x2), float(bbox.y2)]
-            mask = _bbox_to_mask(bbox, W, H)
+            mask = np.zeros((H, W), dtype=np.float32)
+            if bbox.polygon:
+                pts = np.array(bbox.polygon, dtype=np.float32).reshape(-1, 2)
+                pts[:, 0] *= W
+                pts[:, 1] *= H
+                cv2.fillPoly(mask, [pts.astype(np.int32)], 1.0)
+            else:
+                x1, y1 = max(0, int(bbox.x1)), max(0, int(bbox.y1))
+                x2, y2 = min(W, int(bbox.x2)), min(H, int(bbox.y2))
+                mask[y1:y2, x1:x2] = 1.0
             if mask.sum() < 4:
-                continue  # skip degenerate / zero-area boxes
+                continue
             samples.append((pil, box, mask))
-
     return samples
 
 
@@ -143,7 +223,11 @@ def _collect_samples(
 # ---------------------------------------------------------------------------
 
 class SAM2TrainWorker(QThread):
-    """Fine-tune a SAM 2 model on the current annotation store.
+    """Fine-tune a SAM 2 model on an exported YOLO dataset folder.
+
+    Pass *dataset_dir* to read images + label files from disk (the standard
+    path when training from an exported dataset).  Pass *store* as a fallback
+    to train directly from the in-memory annotation store.
 
     Signals
     -------
@@ -163,7 +247,8 @@ class SAM2TrainWorker(QThread):
     def __init__(
         self,
         model_key: str,
-        store: AnnotationStore,
+        dataset_dir: str | None = None,
+        store: AnnotationStore | None = None,
         epochs: int = 10,
         lr: float = 1e-5,
         output_dir: str = "runs/sam2_finetune",
@@ -172,12 +257,15 @@ class SAM2TrainWorker(QThread):
         super().__init__(parent)
         if model_key not in SAM2_MODELS:
             raise ValueError(f"Unknown SAM 2 model key: {model_key!r}")
-        self.model_id   = SAM2_MODELS[model_key]
-        self.store      = store
-        self.epochs     = epochs
-        self.lr         = lr
-        self.output_dir = output_dir
-        self._abort     = False
+        if dataset_dir is None and store is None:
+            raise ValueError("Provide either dataset_dir or store.")
+        self.model_id    = SAM2_MODELS[model_key]
+        self.dataset_dir = dataset_dir
+        self.store       = store
+        self.epochs      = epochs
+        self.lr          = lr
+        self.output_dir  = output_dir
+        self._abort      = False
 
     def abort(self) -> None:
         self._abort = True
@@ -243,13 +331,24 @@ class SAM2TrainWorker(QThread):
         optimizer = AdamW(trainable, lr=self.lr, weight_decay=1e-4)
 
         # ── Build dataset ─────────────────────────────────────────
-        samples = _collect_samples(self.store)
-        if not samples:
-            self.error.emit(
-                "SAM 2 training: no valid annotated frames found in the "
-                "annotation store. Annotate some frames first."
-            )
-            return
+        if self.dataset_dir:
+            samples = _collect_samples_from_dir(self.dataset_dir)
+            if not samples:
+                self.error.emit(
+                    f"SAM 2 training: no labelled images found in:\n"
+                    f"  {self.dataset_dir}\n\n"
+                    f"Make sure the folder contains images/ and labels/ "
+                    f"sub-directories (export your annotations first)."
+                )
+                return
+        else:
+            samples = _collect_samples_from_store(self.store)
+            if not samples:
+                self.error.emit(
+                    "SAM 2 training: no valid annotated frames found in the "
+                    "annotation store. Annotate some frames first."
+                )
+                return
 
         os.makedirs(self.output_dir, exist_ok=True)
 

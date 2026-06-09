@@ -1215,19 +1215,8 @@ class MainWindow(QMainWindow):
         self._train_worker.start()
 
     def _on_train_sam2(self, model_key: str) -> None:
-        """Start SAM 2 fine-tuning on the current annotation store."""
+        """Start SAM 2 fine-tuning from an exported dataset folder."""
         if self._sam2_train_worker and self._sam2_train_worker.isRunning():
-            return
-
-        # Check that we have annotated frames to train on
-        annotated = [a for a in self.store.values() if a.boxes]
-        if not annotated:
-            QMessageBox.information(
-                self, "SAM 2 Training",
-                "No annotated frames found.\n\n"
-                "Annotate at least a few frames with bounding boxes or "
-                "SAM 3 masks before fine-tuning SAM 2."
-            )
             return
 
         try:
@@ -1236,7 +1225,14 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "PyTorch Error", str(exc))
             return
 
-        # Pick output directory
+        # Pick dataset directory (same flow as YOLO training)
+        dataset_dir = QFileDialog.getExistingDirectory(
+            self, "Select Dataset Directory (contains images/ and labels/)", _APP_ROOT
+        )
+        if not dataset_dir:
+            return
+
+        # Pick output directory for the saved checkpoint
         output_dir = QFileDialog.getExistingDirectory(
             self, "Select Output Directory for SAM 2 Checkpoint", _APP_ROOT
         )
@@ -1244,11 +1240,9 @@ class MainWindow(QMainWindow):
             return
 
         epochs = self._epoch_spin.value()
-        sample_count = sum(len(a.boxes) for a in annotated)
 
         self._status_label.setText(
-            f"Fine-tuning {model_key} for {epochs} epochs "
-            f"on {sample_count} annotated boxes…"
+            f"Fine-tuning {model_key} for {epochs} epochs…"
         )
         self._progress.setRange(0, epochs)
         self._progress.setValue(0)
@@ -1257,7 +1251,7 @@ class MainWindow(QMainWindow):
 
         self._sam2_train_worker = SAM2TrainWorker(
             model_key=model_key,
-            store=self.store,
+            dataset_dir=dataset_dir,
             epochs=epochs,
             output_dir=output_dir,
         )
