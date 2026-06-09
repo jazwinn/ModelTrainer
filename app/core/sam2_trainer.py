@@ -195,22 +195,25 @@ class SAM2TrainWorker(QThread):
         import torch
         import torch.nn.functional as F
         from torch.optim import AdamW
-        from transformers import Sam2Model, Sam2Processor
+        from transformers import AutoModel, AutoProcessor
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
         # ── Load model & processor ────────────────────────────────
+        # All published facebook/sam2* checkpoints have model_type="sam2_video",
+        # not "sam2".  AutoModel reads the config and picks the right class
+        # automatically, avoiding the "loading sam2_video into Sam2Model" crash.
         try:
-            processor = Sam2Processor.from_pretrained(
+            processor = AutoProcessor.from_pretrained(
                 self.model_id, local_files_only=True
             )
-            model = Sam2Model.from_pretrained(
+            model = AutoModel.from_pretrained(
                 self.model_id, local_files_only=True
             )
         except Exception:
             # Not cached — download
-            processor = Sam2Processor.from_pretrained(self.model_id)
-            model     = Sam2Model.from_pretrained(self.model_id)
+            processor = AutoProcessor.from_pretrained(self.model_id)
+            model     = AutoModel.from_pretrained(self.model_id)
 
         model = model.to(device).train()
 
