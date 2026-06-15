@@ -71,6 +71,7 @@ from app.core.yolo_trainer import (
     _is_sam2_key,
 )
 from app.core.sam2_trainer import SAM2TrainWorker, SAM2_MODELS
+from app.core.onnx_exporter import ONNXExportWorker
 from app.ui.canvas import AnnotationCanvas
 from app.utils.yolo_exporter import export_dataset
 
@@ -265,6 +266,7 @@ class MainWindow(QMainWindow):
         self._train_worker: YOLOTrainWorker | None = None
         self._sam2_train_worker: SAM2TrainWorker | None = None
         self._seg_converter_worker = None
+        self._onnx_worker: ONNXExportWorker | None = None
 
         # SAM 3 state
         self._sam_load_worker: SAM3LoadWorker | None = None
@@ -468,6 +470,21 @@ class MainWindow(QMainWindow):
             "polygon masks using SAM 3 — no re-labeling required."
         )
         self._act_convert.triggered.connect(self._on_convert_to_seg)
+
+        # ── ONNX export ───────────────────────────────────────────
+        self._onnx_prec_combo = QComboBox()
+        self._onnx_prec_combo.addItems(["FP32", "FP16"])
+        self._onnx_prec_combo.setStyleSheet(_combo_css())
+        self._onnx_prec_combo.setToolTip(
+            "FP32: full precision, runs on any device.\n"
+            "FP16: half precision — smaller file, faster GPU inference (requires CUDA)."
+        )
+
+        self._act_export_onnx = QAction("⬇  Export to ONNX", self)
+        self._act_export_onnx.setToolTip(
+            "Convert a trained .pt checkpoint to ONNX for cross-platform deployment"
+        )
+        self._act_export_onnx.triggered.connect(self._on_export_onnx)
 
     # ──────────────────────────────────────────────────────────────
     # Header bar
@@ -728,6 +745,18 @@ class MainWindow(QMainWindow):
         hint_t.setStyleSheet(f"color: {_MUTED}; font-size: 10px; padding: 4px 0 0 0;")
         hint_t.setWordWrap(True)
         v.addWidget(hint_t)
+        v.addWidget(_hr())
+
+        v.addWidget(_section_lbl("Export to ONNX"))
+        v.addLayout(_row_layout("Precision:", self._onnx_prec_combo))
+        v.addSpacing(8)
+        v.addWidget(_tool_btn(self._act_export_onnx, _css_primary(_ACCENT, hover="#2563eb")))
+        hint_o = QLabel(
+            "Converts a trained .pt checkpoint\nto ONNX. FP16 requires a CUDA GPU."
+        )
+        hint_o.setStyleSheet(f"color: {_MUTED}; font-size: 10px; padding: 4px 0 0 0;")
+        hint_o.setWordWrap(True)
+        v.addWidget(hint_o)
 
         v.addStretch(1)
         return page
@@ -1811,11 +1840,81 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "SAM 2 Training Error", msg)
 
     # ──────────────────────────────────────────────────────────────
+    # ONNX export
+    # ──────────────────────────────────────────────────────────────
+
+    @Slot()
+    def _on_export_onnx(self) -> None:
+        """Convert a trained .pt checkpoint to ONNX at the selected precision."""
+        if self._onnx_worker and self._onnx_worker.isRunning():
+            return
+
+        pt_path, _ = QFileDialog.getOpenFileName(
+            self, "Select .pt checkpoint to export", _APP_ROOT,
+            "PyTorch weights (*.pt)"
+        )
+        if not pt_path:
+            return
+
+        try:
+            import torch
+        except Exception as exc:
+            QMessageBox.critical(self, "PyTorch Error", str(exc))
+            return
+
+        half = self._onnx_prec_combo.currentText().upper().startswith("FP16")
+        if half and not torch.cuda.is_available():
+            QMessageBox.warning(
+                self, "ONNX Export",
+                "FP16 export requires a CUDA GPU, which isn't available.\n\n"
+                "Select FP32 precision instead."
+            )
+            return
+
+        precision = "FP16" if half else "FP32"
+        self._status_label.setText(
+            f"Exporting {os.path.basename(pt_path)} → ONNX ({precision})…"
+        )
+        self._progress.setRange(0, 0)  # indeterminate / busy
+        self._act_export_onnx.setEnabled(False)
+
+        self._onnx_worker = ONNXExportWorker(pt_path=pt_path, half=half)
+        self._onnx_worker.finished.connect(self._on_onnx_finished)
+        self._onnx_worker.error.connect(self._on_onnx_error)
+        self._onnx_worker.start()
+
+    @Slot(str)
+    def _on_onnx_finished(self, onnx_path: str) -> None:
+        self._progress.setRange(0, 1)
+        self._progress.setValue(1)
+        self._act_export_onnx.setEnabled(True)
+        self._status_label.setText(f"ONNX export complete ✓  {onnx_path}")
+        QMessageBox.information(
+            self, "ONNX Export Complete",
+            f"Model exported to:\n{onnx_path}"
+        )
+
+    @Slot(str)
+    def _on_onnx_error(self, msg: str) -> None:
+        self._progress.setRange(0, 1)
+        self._progress.setValue(0)
+        self._act_export_onnx.setEnabled(True)
+        self._status_label.setText(f"ONNX export error: {msg[:80]}")
+        QMessageBox.warning(self, "ONNX Export Error", msg)
+
+    # ──────────────────────────────────────────────────────────────
     # Shared error handler
     # ──────────────────────────────────────────────────────────────
 
     @Slot(str)
     def _on_worker_error(self, msg: str) -> None:
+        # Re-enable training so the user can retry after fixing the cause, and
+        # clear any in-progress bar left behind by the failed worker. (_act_train
+        # is only ever disabled by the training flows, so this is a no-op when a
+        # non-training worker errors.)
+        self._act_train.setEnabled(True)
+        self._progress.setRange(0, 1)
+        self._progress.setValue(0)
         self._status_label.setText(f"Error: {msg[:80]}")
         QMessageBox.warning(self, "Error", msg)
 

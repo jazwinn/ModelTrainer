@@ -7,7 +7,42 @@ DETECTION_MODELS / SEGMENTATION_MODELS provide pre-filtered lists for the UI.
 
 from __future__ import annotations
 
+import os
+
 from qtpy.QtCore import QThread, Signal
+
+# Project root = two levels up from app/core/yolo_trainer.py
+_PROJECT_ROOT = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+)
+RUNS_DIR = os.path.join(_PROJECT_ROOT, "runs")
+
+
+def configure_ultralytics_dirs() -> str:
+    """Force Ultralytics to read/write everything inside the project root.
+
+    Ultralytics keeps global runs/weights/datasets directories in
+    ``%APPDATA%/Ultralytics/settings.json``; out of the box these can point
+    *outside* this project (e.g. ``C:/Users/<you>/ModelTrainer/runs``), which
+    scatters generated files. Repoint them under the project root so training
+    runs, downloaded weights and datasets all stay inside it. Returns RUNS_DIR.
+    """
+    try:
+        from ultralytics import settings as _ul_settings
+        wanted = {
+            "runs_dir":     RUNS_DIR,
+            "weights_dir":  os.path.join(_PROJECT_ROOT, "weights"),
+            "datasets_dir": _PROJECT_ROOT,
+        }
+        # Only write when something actually differs (avoids needless disk I/O).
+        if any(str(_ul_settings.get(k, "")) != v for k, v in wanted.items()):
+            _ul_settings.update(wanted)
+    except Exception:
+        # Settings-API differences or read-only FS — call sites still pass an
+        # absolute project path, which keeps outputs inside the root regardless.
+        pass
+    return RUNS_DIR
+
 
 MODEL_REGISTRY: dict[str, str] = {
     # ── Detection ─────────────────────────────────────────────────────────
@@ -100,7 +135,7 @@ class YOLOTrainWorker(QThread):
         data_yaml: str,
         epochs: int = 50,
         imgsz: int = 640,
-        project: str = "runs/train",
+        project: str | None = None,
         name: str = "exp",
         parent=None,
     ):
@@ -111,7 +146,8 @@ class YOLOTrainWorker(QThread):
         self.data_yaml     = data_yaml
         self.epochs        = epochs
         self.imgsz         = imgsz
-        self.project       = project
+        # Absolute path keeps training runs inside the project root.
+        self.project       = project or os.path.join(RUNS_DIR, "train")
         self.name          = name
         self._total_epochs = epochs
         self._is_seg       = _is_seg_key(model_key)
@@ -140,6 +176,8 @@ class YOLOTrainWorker(QThread):
     def run(self) -> None:
         try:
             from ultralytics import YOLO
+
+            configure_ultralytics_dirs()  # keep all outputs inside the project root
 
             model = self._build_model(YOLO)
 
