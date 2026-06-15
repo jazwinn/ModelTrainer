@@ -480,6 +480,14 @@ class MainWindow(QMainWindow):
             "FP16: half precision — smaller file, faster GPU inference (requires CUDA)."
         )
 
+        self._onnx_shape_combo = QComboBox()
+        self._onnx_shape_combo.addItems(["Dynamic", "Static"])
+        self._onnx_shape_combo.setStyleSheet(_combo_css())
+        self._onnx_shape_combo.setToolTip(
+            "Dynamic: variable batch size / input resolution (more flexible).\n"
+            "Static: fixed input shape — faster on some runtimes, required by a few."
+        )
+
         self._act_export_onnx = QAction("⬇  Export to ONNX", self)
         self._act_export_onnx.setToolTip(
             "Convert a trained .pt checkpoint to ONNX for cross-platform deployment"
@@ -749,6 +757,8 @@ class MainWindow(QMainWindow):
 
         v.addWidget(_section_lbl("Export to ONNX"))
         v.addLayout(_row_layout("Precision:", self._onnx_prec_combo))
+        v.addSpacing(4)
+        v.addLayout(_row_layout("Shape:", self._onnx_shape_combo))
         v.addSpacing(8)
         v.addWidget(_tool_btn(self._act_export_onnx, _css_primary(_ACCENT, hover="#2563eb")))
         hint_o = QLabel(
@@ -1871,14 +1881,19 @@ class MainWindow(QMainWindow):
             )
             return
 
+        dynamic = self._onnx_shape_combo.currentText() == "Dynamic"
+
         precision = "FP16" if half else "FP32"
+        shape = "dynamic" if dynamic else "static"
         self._status_label.setText(
-            f"Exporting {os.path.basename(pt_path)} → ONNX ({precision})…"
+            f"Exporting {os.path.basename(pt_path)} → ONNX ({precision}, {shape})…"
         )
         self._progress.setRange(0, 0)  # indeterminate / busy
         self._act_export_onnx.setEnabled(False)
 
-        self._onnx_worker = ONNXExportWorker(pt_path=pt_path, half=half)
+        self._onnx_worker = ONNXExportWorker(
+            pt_path=pt_path, half=half, dynamic=dynamic
+        )
         self._onnx_worker.finished.connect(self._on_onnx_finished)
         self._onnx_worker.error.connect(self._on_onnx_error)
         self._onnx_worker.start()
