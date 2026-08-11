@@ -88,6 +88,18 @@ MODEL_REGISTRY: dict[str, str] = {
     # FastSAM — pretrained segmentation checkpoints (always seg-only).
     "FastSAM-s":     "FastSAM-s.pt",
     "FastSAM-x":     "FastSAM-x.pt",
+    # ── Pose ──────────────────────────────────────────────────────────────
+    # v8 / v11 ship pretrained -pose.pt checkpoints (direct download).
+    "YOLOv8n-pose":  "yolov8n-pose.pt",
+    "YOLOv8s-pose":  "yolov8s-pose.pt",
+    "YOLOv8m-pose":  "yolov8m-pose.pt",
+    "YOLOv8l-pose":  "yolov8l-pose.pt",
+    "YOLOv8x-pose":  "yolov8x-pose.pt",
+    "YOLO11n-pose":  "yolo11n-pose.pt",
+    "YOLO11s-pose":  "yolo11s-pose.pt",
+    "YOLO11m-pose":  "yolo11m-pose.pt",
+    "YOLO11l-pose":  "yolo11l-pose.pt",
+    "YOLO11x-pose":  "yolo11x-pose.pt",
 }
 
 # For seg models built from a .yaml (no pretrained seg weights), transfer the
@@ -104,12 +116,15 @@ SEG_TRANSFER_BASE: dict[str, str] = {
     "YOLO26l-seg": "yolo26l.pt",
 }
 
-# Keys that are segmentation models (ends with -seg OR is a FastSAM variant)
 def _is_seg_key(key: str) -> bool:
     return key.endswith("-seg") or key.startswith("FastSAM")
 
-DETECTION_MODELS:    list[str] = [k for k in MODEL_REGISTRY if not _is_seg_key(k)]
+def _is_pose_key(key: str) -> bool:
+    return key.endswith("-pose")
+
+DETECTION_MODELS:    list[str] = [k for k in MODEL_REGISTRY if not _is_seg_key(k) and not _is_pose_key(k)]
 SEGMENTATION_MODELS: list[str] = [k for k in MODEL_REGISTRY if _is_seg_key(k)]
+POSE_MODELS:         list[str] = [k for k in MODEL_REGISTRY if _is_pose_key(k)]
 
 # SAM 2 keys are handled by sam2_trainer; re-exported here for convenience.
 def _is_sam2_key(key: str) -> bool:
@@ -137,6 +152,8 @@ class YOLOTrainWorker(QThread):
         imgsz: int = 640,
         project: str | None = None,
         name: str = "exp",
+        cache: bool | str = False,
+        workers: int = 4,
         parent=None,
     ):
         super().__init__(parent)
@@ -149,8 +166,11 @@ class YOLOTrainWorker(QThread):
         # Absolute path keeps training runs inside the project root.
         self.project       = project or os.path.join(RUNS_DIR, "train")
         self.name          = name
+        self.cache         = cache
+        self.workers       = workers
         self._total_epochs = epochs
         self._is_seg       = _is_seg_key(model_key)
+        self._is_pose      = _is_pose_key(model_key)
 
     def _build_model(self, YOLO):
         """Construct the YOLO model for self.model_key.
@@ -181,12 +201,18 @@ class YOLOTrainWorker(QThread):
 
             model = self._build_model(YOLO)
 
-            is_seg = self._is_seg
+            is_seg  = self._is_seg
+            is_pose = self._is_pose
 
             def _on_epoch_end(trainer) -> None:
                 epoch = trainer.epoch + 1
                 m = trainer.metrics
-                if is_seg:
+                if is_pose:
+                    map50 = float(
+                        m.get("metrics/mAP50(P)", 0.0)
+                        or m.get("mAP50", 0.0)
+                    )
+                elif is_seg:
                     # For seg models prefer mask mAP50; fall back to box mAP50
                     map50 = float(
                         m.get("metrics/mAP50(M)", 0.0)
@@ -210,9 +236,9 @@ class YOLOTrainWorker(QThread):
                 name=self.name,
                 exist_ok=True,
                 verbose=False,
-                batch=-1,    # auto-batch to maximise VRAM
-                cache=True,
-                workers=8,
+                batch=-1,      # auto-batch to maximise VRAM
+                cache=self.cache,
+                workers=self.workers,
             )
 
             best = str(getattr(results, "best", "") or "")

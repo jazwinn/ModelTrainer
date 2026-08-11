@@ -19,6 +19,26 @@ import yaml
 from app.core.sam3_handler import AnnotationStore, BBox, FrameAnnotation
 
 
+# ---------------------------------------------------------------------------
+# YAML helpers — produces inline lists for kpt_shape: [4, 3]
+# ---------------------------------------------------------------------------
+
+class _InlineList(list):
+    """Marker subclass so the custom representer can target it specifically."""
+
+
+class _YAMLDumper(yaml.Dumper):
+    pass
+
+
+_YAMLDumper.add_representer(
+    _InlineList,
+    lambda dumper, data: dumper.represent_sequence(
+        "tag:yaml.org,2002:seq", data, flow_style=True
+    ),
+)
+
+
 def _bbox_to_yolo(bbox: BBox, img_w: int, img_h: int) -> str:
     cx = ((bbox.x1 + bbox.x2) / 2.0) / img_w
     cy = ((bbox.y1 + bbox.y2) / 2.0) / img_h
@@ -54,19 +74,60 @@ def _bbox_to_yolo_seg(bbox: BBox, img_w: int, img_h: int) -> str:
     return f"{bbox.class_id} {coords_str}"
 
 
+def _bbox_to_yolo_pose(bbox: BBox, img_w: int, img_h: int) -> str:
+    """Return a YOLO pose label line for *bbox* with 4 corner keypoints.
+
+    Keypoint order: TL (0), TR (1), BR (2), BL (3).
+
+    Priority: stored bbox.keypoints (user may have dragged/removed corners) →
+    extract_four_corners from polygon → axis-aligned bbox corners.
+    None entries (removed corners) export as '0.0 0.0 0' (not labeled).
+    """
+    from app.core.yolo_pose_converter import extract_four_corners, bbox_corners_tl_tr_br_bl
+
+    cx = max(0.0, min(1.0, ((bbox.x1 + bbox.x2) / 2.0) / img_w))
+    cy = max(0.0, min(1.0, ((bbox.y1 + bbox.y2) / 2.0) / img_h))
+    bw = max(0.0, min(1.0, (bbox.x2 - bbox.x1) / img_w))
+    bh = max(0.0, min(1.0, (bbox.y2 - bbox.y1) / img_h))
+
+    if bbox.keypoints is not None:
+        parts = []
+        for kpt in bbox.keypoints:
+            if kpt is None:
+                parts.append("0.000000 0.000000 0")
+            else:
+                parts.append(f"{kpt[0]:.6f} {kpt[1]:.6f} 1")
+        kpt_parts = " ".join(parts)
+    elif bbox.polygon:
+        polygon_flat = [max(0.0, min(1.0, v)) for v in bbox.polygon]
+        kpts = extract_four_corners(polygon_flat)
+        kpt_parts = " ".join(f"{x:.6f} {y:.6f} 1" for x, y in kpts)
+    else:
+        x1 = max(0.0, min(1.0, bbox.x1 / img_w))
+        y1 = max(0.0, min(1.0, bbox.y1 / img_h))
+        x2 = max(0.0, min(1.0, bbox.x2 / img_w))
+        y2 = max(0.0, min(1.0, bbox.y2 / img_h))
+        kpts = bbox_corners_tl_tr_br_bl(x1, y1, x2, y2)
+        kpt_parts = " ".join(f"{x:.6f} {y:.6f} 1" for x, y in kpts)
+
+    return f"{bbox.class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f} {kpt_parts}"
+
+
 def export_dataset(
     store: AnnotationStore,
     class_names: list[str],
     output_dir: str,
     skip_unverified: bool = False,
     is_seg: bool = False,
+    is_pose: bool = False,
 ) -> int:
     """
     Write YOLO dataset to output_dir.  Returns the number of frames exported.
     Frames with status "exported" are re-exported (idempotent).
     If skip_unverified is True, frames still in "pending" status are skipped.
-    If is_seg is True, labels are written in YOLO segmentation polygon format
-    and data.yaml includes ``task: segment`` (required for FastSAM / *-seg models).
+    If is_seg is True, labels use YOLO segmentation polygon format.
+    If is_pose is True, labels use YOLO pose format with 4 corner keypoints
+    (TL, TR, BR, BL) extracted from the segmentation polygon when available.
     """
     images_dir = os.path.join(output_dir, "images")
     labels_dir = os.path.join(output_dir, "labels")
@@ -95,7 +156,9 @@ def export_dataset(
         if annotation.image_path != dst_img:
             shutil.copy2(annotation.image_path, dst_img)
 
-        if is_seg:
+        if is_pose:
+            lines = [_bbox_to_yolo_pose(b, img_w, img_h) for b in annotation.boxes]
+        elif is_seg:
             lines = [_bbox_to_yolo_seg(b, img_w, img_h) for b in annotation.boxes]
         else:
             lines = [_bbox_to_yolo(b, img_w, img_h) for b in annotation.boxes]
@@ -107,17 +170,24 @@ def export_dataset(
 
     # Write data.yaml
     yaml_path = os.path.join(output_dir, "data.yaml")
-    names_dict = {i: name for i, name in enumerate(class_names)} if class_names else {0: "object"}
+    names_list = list(class_names) if class_names else ["object"]
+    if is_pose:
+        task = "pose"
+    elif is_seg:
+        task = "segment"
+    else:
+        task = "detect"
     data_yaml: dict = {
-        "path": os.path.abspath(output_dir),
+        "path":  os.path.abspath(output_dir).replace("\\", "/"),
         "train": "images",
         "val":   "images",
-        "nc":    len(names_dict),
-        "names": names_dict,
+        "nc":    len(names_list),
+        "names": names_list,
+        "task":  task,
     }
-    if is_seg:
-        data_yaml["task"] = "segment"
+    if is_pose:
+        data_yaml["kpt_shape"] = _InlineList([4, 3])
     with open(yaml_path, "w", encoding="utf-8") as fh:
-        yaml.dump(data_yaml, fh, default_flow_style=False, sort_keys=False)
+        yaml.dump(data_yaml, fh, Dumper=_YAMLDumper, default_flow_style=False, sort_keys=False)
 
     return exported_count

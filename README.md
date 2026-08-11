@@ -19,9 +19,13 @@ A powerful, native desktop application for dataset annotation and computer visio
 * **Manual Annotation:** Fast and intuitive manual bounding box drawing with full resize and drag support.
 
 ### Training & Export
-* **YOLO Dataset Export:** Automatically format and export your labeled frames into standard YOLO format with a generated `data.yaml`.
-* **Embedded YOLO Training:** Train YOLOv8, YOLOv11, or YOLO26 models directly inside the application. Features automatic VRAM batch scaling (`batch=-1`), dataset caching, and real-time training progress UI.
-* **GPU Acceleration:** Fully utilizes CUDA for blazing fast SAM 3 inference and YOLO training. Diagnostics printed on startup.
+* **YOLO Dataset Export:** Automatically format and export labeled frames into standard YOLO detection, segmentation, or pose format with a correctly structured `data.yaml` (`task`, `kpt_shape`, `names` list, forward-slash paths).
+* **Pose Keypoint Annotation:** Pose bboxes display four draggable corner keypoints (TL / TR / BR / BL). Hover to see corner labels. Right-click a keypoint to remove it (shown as a ghost dot for partially-visible objects). Right-click a ghost to restore it. Keypoints are exported with visibility flags compatible with all Ultralytics versions.
+* **Seg → Pose Conversion:** Convert any YOLO segmentation dataset to pose format in one click — no ML model required. Extracts the four geometric corners of each polygon mask. Configurable edge-margin filter automatically removes keypoints too close to the image boundary (avoids ambiguous labels). Removed corners appear as ghost dots in the Annotate tab and can be restored by clicking.
+* **Embedded YOLO Training:** Train YOLOv8, YOLOv11, or YOLO26 detection / segmentation / pose models directly inside the app. Features automatic VRAM batch scaling, configurable image caching, and real-time per-epoch mAP50 progress.
+* **Memory-Efficient Training:** Cache mode (Off / Disk / RAM) and worker count are exposed in the UI so you can trade training speed for RAM. Default is **Off** — safe for large datasets on 16–32 GB machines.
+* **ONNX Export:** Convert any trained `.pt` checkpoint to ONNX with FP32 or FP16 precision and dynamic or static input shape.
+* **GPU Acceleration:** Fully utilizes CUDA for SAM 3 inference and YOLO training. Diagnostics printed on startup.
 * **Multi-GPU Support:** Automatically selects best available device (GPU first, CPU fallback).
 
 ## Requirements
@@ -98,10 +102,16 @@ python -m app.main
 ### Train Tab
 | Control | Purpose |
 |---------|---------|
-| **Export YOLO** | Write frames + `labels/*.txt` + `data.yaml` to a folder |
-| **Model** | YOLO architecture (YOLOv8n/s/m/l, YOLO11n/s/m/l, YOLO26n/s/m/l) |
+| **Export YOLO** | Write frames + `labels/*.txt` + `data.yaml` to a folder (task auto-detected from Task selector) |
+| **Convert to Segmentation** | Convert a detection dataset (bboxes) → polygon masks using SAM 3 |
+| **Convert to Pose** | Convert a segmentation dataset (polygons) → 4-corner pose keypoints; prompts for edge-margin % |
+| **Task** | Detection / Segmentation / Pose — controls export format and model list |
+| **Model** | YOLO architecture; pose models listed when Pose task is selected |
 | **Epochs** | Training epochs |
-| **Start Training** | Point to exported dataset folder and begin training |
+| **Cache** | **Off** (default, RAM-safe) / Disk / RAM — controls image pre-loading strategy |
+| **Workers** | Dataloader subprocess count (default 4); reduce to 2 if RAM is limited |
+| **Start Training** | Point to exported dataset `data.yaml` and begin training |
+| **Export to ONNX** | Convert a trained `.pt` to ONNX (FP32/FP16, Dynamic/Static shape) |
 
 ## Diagnostics
 

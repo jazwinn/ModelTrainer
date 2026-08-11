@@ -37,18 +37,22 @@ class BBox:
     y2: float
     class_id: int = 0
     source: str = "sam"  # "sam" | "manual" | "dataset"
-    polygon: list[float] | None = None  # flat [x1,y1,...] normalized 0–1 for seg labels
+    polygon: list[float] | None = None   # flat [x1,y1,...] normalized 0–1 for seg labels
+    keypoints: list[tuple[float, float] | None] | None = None  # normalized (x,y); None entry = removed corner
 
     def to_dict(self) -> dict:
         return {"x1": self.x1, "y1": self.y1, "x2": self.x2, "y2": self.y2,
                 "class_id": self.class_id, "source": self.source,
-                "polygon": self.polygon}
+                "polygon": self.polygon, "keypoints": self.keypoints}
 
     @staticmethod
     def from_dict(d: dict) -> "BBox":
+        kpts = d.get("keypoints")
+        if kpts is not None:
+            kpts = [tuple(k) if k is not None else None for k in kpts]
         return BBox(x1=d["x1"], y1=d["y1"], x2=d["x2"], y2=d["y2"],
                     class_id=d.get("class_id", 0), source=d.get("source", "sam"),
-                    polygon=d.get("polygon"))
+                    polygon=d.get("polygon"), keypoints=kpts)
 
 
 @dataclass

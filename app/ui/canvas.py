@@ -22,6 +22,7 @@ from qtpy.QtWidgets import (
     QGraphicsPolygonItem,
     QGraphicsEllipseItem,
     QGraphicsPixmapItem,
+    QGraphicsSimpleTextItem,
     QApplication,
 )
 
@@ -34,7 +35,11 @@ BOX_COLOR_SAM    = QColor(0, 180, 255, 180)
 BOX_COLOR_MANUAL = QColor(0, 255, 120, 180)
 BOX_SEL_COLOR    = QColor(255, 200, 0, 220)
 BOX_THICKNESS    = 2
-POLY_COLOR       = QColor(255, 80, 160, 180)  # magenta — segmentation polygons
+POLY_COLOR       = QColor(255, 80, 160, 180)   # magenta — segmentation polygons
+KEYPOINT_COLOR   = QColor(0, 220, 170, 230)    # teal — pose keypoints
+KEYPOINT_OUTLINE = QColor(255, 255, 255, 200)
+KEYPOINT_HOVER   = QColor(255, 220, 0, 255)
+KEYPOINT_SIZE    = 14.0
 
 _HANDLES = [
     "tl", "tm", "tr",
@@ -158,6 +163,138 @@ class SegPolygonItem(QGraphicsPolygonItem):
 
 
 # ---------------------------------------------------------------------------
+# Pose keypoint dot (draggable, right-click to remove)
+# ---------------------------------------------------------------------------
+
+class PoseKeypointItem(QGraphicsEllipseItem):
+    """Interactive pose keypoint — drag to reposition, right-click to remove/restore."""
+
+    _LABELS      = ("TL", "TR", "BR", "BL")
+    _FULL_LABELS = ("Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left")
+
+    def __init__(
+        self,
+        x_norm: float,
+        y_norm: float,
+        img_w: int,
+        img_h: int,
+        bbox: "BBox",
+        index: int = 0,
+        is_ghost: bool = False,
+    ):
+        self.x_norm = x_norm
+        self.y_norm = y_norm
+        self.img_w = img_w
+        self.img_h = img_h
+        self.bbox = bbox
+        self.index = index
+        self.is_ghost = is_ghost
+
+        r = KEYPOINT_SIZE / 2
+        cx = x_norm * img_w
+        cy = y_norm * img_h
+        super().__init__(cx - r, cy - r, KEYPOINT_SIZE, KEYPOINT_SIZE)
+
+        self._normal_pen = (
+            QPen(QColor(KEYPOINT_COLOR.red(), KEYPOINT_COLOR.green(),
+                        KEYPOINT_COLOR.blue(), 120), 1.5, Qt.DashLine)
+            if is_ghost else QPen(KEYPOINT_OUTLINE, 1.5)
+        )
+        self._hover_pen = QPen(KEYPOINT_HOVER, 2.5)
+
+        self.setBrush(QBrush(Qt.NoBrush) if is_ghost else QBrush(KEYPOINT_COLOR))
+        self.setPen(self._normal_pen)
+        self.setZValue(8 if is_ghost else 9)
+        self.setFlag(QGraphicsEllipseItem.ItemIsSelectable, False)
+        self.setFlag(QGraphicsEllipseItem.ItemIsMovable, False)
+        self.setAcceptHoverEvents(True)
+        self.setCursor(Qt.OpenHandCursor)
+
+        full = self._FULL_LABELS[index] if index < len(self._FULL_LABELS) else str(index)
+        if is_ghost:
+            self.setToolTip(f"{full} [removed]\nDrag or right-click to restore")
+        else:
+            self.setToolTip(f"{full} (kpt {index})\nDrag to move · Right-click to remove")
+
+        # Floating hover label — shown immediately on hover (no system delay)
+        label_text = f"{full} [removed]" if is_ghost else full
+        self._label_item = QGraphicsSimpleTextItem(label_text, self)
+        self._label_item.setBrush(QBrush(QColor(200, 200, 200) if is_ghost else QColor(255, 255, 255)))
+        _font = self._label_item.font()
+        _font.setPixelSize(11)
+        _font.setBold(True)
+        self._label_item.setFont(_font)
+        lw = self._label_item.boundingRect().width()
+        lh = self._label_item.boundingRect().height()
+        self._label_item.setPos(cx + r + 5, cy - lh / 2)
+        self._label_item.setZValue(20)
+        self._label_item.setVisible(False)
+
+        # Semi-transparent background behind the label text
+        self._label_bg = QGraphicsRectItem(QRectF(-2, -2, lw + 4, lh + 4), self)
+        self._label_bg.setBrush(QBrush(QColor(0, 0, 0, 160)))
+        self._label_bg.setPen(QPen(Qt.NoPen))
+        self._label_bg.setPos(cx + r + 3, cy - lh / 2)
+        self._label_bg.setZValue(19)
+        self._label_bg.setVisible(False)
+
+    def hoverEnterEvent(self, event):
+        self.setPen(self._hover_pen)
+        self._label_item.setVisible(True)
+        self._label_bg.setVisible(True)
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event):
+        self.setPen(self._normal_pen)
+        self._label_item.setVisible(False)
+        self._label_bg.setVisible(False)
+        super().hoverLeaveEvent(event)
+
+    def paint(self, painter, option, widget=None):
+        super().paint(painter, option, widget)
+        if not self.is_ghost:
+            painter.setPen(QPen(QColor(255, 255, 255, 220)))
+            font = painter.font()
+            font.setPixelSize(max(7, int(KEYPOINT_SIZE * 0.5)))
+            font.setBold(True)
+            painter.setFont(font)
+            painter.drawText(self.boundingRect(), Qt.AlignCenter, str(self.index))
+
+    def materialize(self) -> None:
+        """Convert ghost → real keypoint and persist the position to the BBox."""
+        self.is_ghost = False
+        self.setBrush(QBrush(KEYPOINT_COLOR))
+        self._normal_pen = QPen(KEYPOINT_OUTLINE, 1.5)
+        self.setPen(self._normal_pen)
+        self.setZValue(9)
+        full = self._FULL_LABELS[self.index] if self.index < len(self._FULL_LABELS) else str(self.index)
+        self.setToolTip(f"{full} (kpt {self.index})\nDrag to move · Right-click to remove")
+        self._label_item.setText(full)
+        self._label_item.setBrush(QBrush(QColor(255, 255, 255)))
+        if self.bbox.keypoints is not None:
+            kpts = list(self.bbox.keypoints)
+            kpts[self.index] = (self.x_norm, self.y_norm)
+            self.bbox.keypoints = kpts
+
+    def move_to(self, x_norm: float, y_norm: float) -> None:
+        """Update position (normalized). For real keypoints, also updates the BBox."""
+        self.x_norm = x_norm
+        self.y_norm = y_norm
+        cx = x_norm * self.img_w
+        cy = y_norm * self.img_h
+        r = KEYPOINT_SIZE / 2
+        self.setRect(cx - r, cy - r, KEYPOINT_SIZE, KEYPOINT_SIZE)
+        lh = self._label_item.boundingRect().height()
+        lw = self._label_item.boundingRect().width()
+        self._label_item.setPos(cx + r + 5, cy - lh / 2)
+        self._label_bg.setPos(cx + r + 3, cy - lh / 2)
+        if not self.is_ghost and self.bbox.keypoints is not None:
+            kpts = list(self.bbox.keypoints)
+            kpts[self.index] = (x_norm, y_norm)
+            self.bbox.keypoints = kpts
+
+
+# ---------------------------------------------------------------------------
 # Canvas
 # ---------------------------------------------------------------------------
 
@@ -203,6 +340,10 @@ class AnnotationCanvas(QGraphicsView):
         # Pan state
         self._pan_last: QPointF | None = None
 
+        # Keypoint drag state
+        self._keypoint_items: list[PoseKeypointItem] = []
+        self._drag_keypoint: PoseKeypointItem | None = None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -223,14 +364,21 @@ class AnnotationCanvas(QGraphicsView):
         self._neg_exemplars = []
         self._exemplar_kind = None
         self.exemplars_changed.emit()
+        self._keypoint_items = []
+        self._drag_keypoint = None
 
         pixmap = QPixmap(png_path)
         self._pixmap_item = self._scene.addPixmap(pixmap)
         self._scene.setSceneRect(QRectF(pixmap.rect()))
 
         for bbox in boxes:
-            if bbox.polygon:
+            if bbox.keypoints:
+                # Pose: keypoint dots only (no bounding rect — keypoints are the label)
+                self._add_keypoint_items(bbox)
+            elif bbox.polygon:
+                # Segmentation: polygon overlay + selectable bounding rect
                 self._add_polygon_item(bbox)
+                self._add_rect_item(bbox)
             else:
                 self._add_rect_item(bbox)
 
@@ -308,6 +456,34 @@ class AnnotationCanvas(QGraphicsView):
         self._scene.addItem(item)
         return item
 
+    def _add_keypoint_items(self, bbox: BBox) -> list[PoseKeypointItem]:
+        sr = self._scene.sceneRect()
+        img_w = int(sr.width())
+        img_h = int(sr.height())
+        # Axis-aligned bbox corners used as fallback positions for ghost keypoints
+        x1n = max(0.0, min(1.0, bbox.x1 / img_w))
+        y1n = max(0.0, min(1.0, bbox.y1 / img_h))
+        x2n = max(0.0, min(1.0, bbox.x2 / img_w))
+        y2n = max(0.0, min(1.0, bbox.y2 / img_h))
+        _ghost_pos = [(x1n, y1n), (x2n, y1n), (x2n, y2n), (x1n, y2n)]
+        items = []
+        for i, kpt in enumerate(bbox.keypoints or []):
+            if kpt is None:
+                gx, gy = _ghost_pos[i] if i < len(_ghost_pos) else (0.5, 0.5)
+                item = PoseKeypointItem(gx, gy, img_w, img_h, bbox=bbox, index=i, is_ghost=True)
+            else:
+                item = PoseKeypointItem(kpt[0], kpt[1], img_w, img_h, bbox=bbox, index=i)
+            self._scene.addItem(item)
+            self._keypoint_items.append(item)
+            items.append(item)
+        return items
+
+    def _keypoint_at(self, scene_pos: QPointF) -> "PoseKeypointItem | None":
+        for item in self._scene.items(scene_pos):
+            if isinstance(item, PoseKeypointItem):
+                return item
+        return None
+
     def _select(self, item: AnnotationRect | None) -> None:
         if self._selected_rect and self._selected_rect is not item:
             self._selected_rect.set_selected_style(False)
@@ -352,6 +528,45 @@ class AnnotationCanvas(QGraphicsView):
                     QRectF(scene_pos, scene_pos), pen, QBrush(Qt.transparent)
                 )
             return
+
+        # Keypoint interaction (non-SAM mode)
+        if not self._sam_mode:
+            kpt_hit = self._keypoint_at(scene_pos)
+            if kpt_hit is not None:
+                if event.button() == Qt.LeftButton:
+                    self._drag_keypoint = kpt_hit
+                    kpt_hit.setPen(kpt_hit._hover_pen)
+                    return
+                elif event.button() == Qt.RightButton:
+                    bbox = kpt_hit.bbox
+                    if kpt_hit.is_ghost:
+                        # Restore: convert ghost to real keypoint at its current position
+                        kpt_hit.materialize()
+                    else:
+                        # Remove: set to None and replace with ghost
+                        if bbox.keypoints is not None:
+                            kpts = list(bbox.keypoints)
+                            kpts[kpt_hit.index] = None
+                            bbox.keypoints = kpts
+                        self._scene.removeItem(kpt_hit)
+                        if kpt_hit in self._keypoint_items:
+                            self._keypoint_items.remove(kpt_hit)
+                        # Add a ghost in its place
+                        sr = self._scene.sceneRect()
+                        img_w = int(sr.width())
+                        img_h = int(sr.height())
+                        x1n = max(0.0, min(1.0, bbox.x1 / img_w))
+                        y1n = max(0.0, min(1.0, bbox.y1 / img_h))
+                        x2n = max(0.0, min(1.0, bbox.x2 / img_w))
+                        y2n = max(0.0, min(1.0, bbox.y2 / img_h))
+                        _gpos = [(x1n, y1n), (x2n, y1n), (x2n, y2n), (x1n, y2n)]
+                        i = kpt_hit.index
+                        gx, gy = _gpos[i] if i < len(_gpos) else (0.5, 0.5)
+                        ghost = PoseKeypointItem(gx, gy, img_w, img_h, bbox=bbox, index=i, is_ghost=True)
+                        self._scene.addItem(ghost)
+                        self._keypoint_items.append(ghost)
+                    self.box_edited.emit(bbox)
+                    return
 
         if event.button() == Qt.LeftButton:
             # Check if clicking a resize handle
@@ -405,6 +620,13 @@ class AnnotationCanvas(QGraphicsView):
             )
             return
 
+        if self._drag_keypoint is not None:
+            sr = self._scene.sceneRect()
+            nx = max(0.0, min(1.0, scene_pos.x() / sr.width()))
+            ny = max(0.0, min(1.0, scene_pos.y() / sr.height()))
+            self._drag_keypoint.move_to(nx, ny)
+            return
+
         if self._drag_rect and self._drag_start_scene and self._drag_orig_rect:
             dx = scene_pos.x() - self._drag_start_scene.x()
             dy = scene_pos.y() - self._drag_start_scene.y()
@@ -442,6 +664,15 @@ class AnnotationCanvas(QGraphicsView):
                 rect = QRectF(start, scene_pos).normalized()
                 if rect.width() > 5 and rect.height() > 5:
                     self._add_exemplar(rect, kind)
+            return
+
+        if event.button() == Qt.LeftButton and self._drag_keypoint is not None:
+            kpt = self._drag_keypoint
+            self._drag_keypoint = None
+            if kpt.is_ghost:
+                kpt.materialize()  # dragging a ghost converts it to a real keypoint
+            kpt.setPen(kpt._normal_pen)
+            self.box_edited.emit(kpt.bbox)
             return
 
         if event.button() == Qt.LeftButton:

@@ -67,8 +67,8 @@ from app.core.sam3_handler import (
 from app.core.media_loader import MediaLoaderWorker
 from app.core.yolo_trainer import (
     YOLOTrainWorker, MODEL_REGISTRY,
-    DETECTION_MODELS, SEGMENTATION_MODELS,
-    _is_sam2_key,
+    DETECTION_MODELS, SEGMENTATION_MODELS, POSE_MODELS,
+    _is_sam2_key, _is_pose_key,
 )
 from app.core.sam2_trainer import SAM2TrainWorker, SAM2_MODELS
 from app.core.onnx_exporter import ONNXExportWorker
@@ -136,6 +136,14 @@ def _make_thumbnail(png_path: str) -> QPixmap:
         _THUMBNAIL_SIZE, _THUMBNAIL_SIZE,
         Qt.KeepAspectRatio, Qt.SmoothTransformation,
     )
+
+
+def _first_existing(*paths: str) -> str | None:
+    """Return the first path that exists on disk, or None."""
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    return None
 
 
 def _hr() -> QFrame:
@@ -260,12 +268,14 @@ class MainWindow(QMainWindow):
         self._video_import_stride: dict[str, int] = {}
         # Set when importing a YOLO dataset — labels dir to apply after import
         self._pending_labels_dir: str | None = None
+        self._pending_dataset_task: str = "detect"
 
         # Active workers
         self._media_worker: MediaLoaderWorker | None = None
         self._train_worker: YOLOTrainWorker | None = None
         self._sam2_train_worker: SAM2TrainWorker | None = None
         self._seg_converter_worker = None
+        self._pose_converter_worker = None
         self._onnx_worker: ONNXExportWorker | None = None
 
         # SAM 3 state
@@ -446,7 +456,7 @@ class MainWindow(QMainWindow):
         self._act_export.triggered.connect(self._on_export)
 
         self._task_combo = QComboBox()
-        self._task_combo.addItems(["Detection", "Segmentation"])
+        self._task_combo.addItems(["Detection", "Segmentation", "Pose"])
         self._task_combo.setStyleSheet(_combo_css())
         self._task_combo.currentIndexChanged.connect(self._on_task_changed)
 
@@ -459,6 +469,25 @@ class MainWindow(QMainWindow):
         self._epoch_spin.setValue(50)
         self._epoch_spin.setStyleSheet(_spin_css())
 
+        self._cache_combo = QComboBox()
+        self._cache_combo.addItems(["Off (RAM-safe)", "Disk", "RAM"])
+        self._cache_combo.setCurrentIndex(0)
+        self._cache_combo.setStyleSheet(_combo_css())
+        self._cache_combo.setToolTip(
+            "Off: decode images from disk each batch — lowest RAM use.\n"
+            "Disk: pre-process once and cache to disk — faster, moderate RAM.\n"
+            "RAM: load entire dataset into RAM — fastest but exhausts memory on large datasets."
+        )
+
+        self._workers_spin = QSpinBox()
+        self._workers_spin.setRange(1, 16)
+        self._workers_spin.setValue(4)
+        self._workers_spin.setStyleSheet(_spin_css())
+        self._workers_spin.setToolTip(
+            "Dataloader worker processes. Each worker uses its own RAM.\n"
+            "Reduce to 2-4 if training causes high memory usage."
+        )
+
         self._act_train = QAction("▶  Start Training", self)
         self._act_train.setToolTip("Train the selected YOLO model on exported annotations")
         self._act_train.setEnabled(True)   # always available — picks data.yaml folder at runtime
@@ -470,6 +499,13 @@ class MainWindow(QMainWindow):
             "polygon masks using SAM 3 — no re-labeling required."
         )
         self._act_convert.triggered.connect(self._on_convert_to_seg)
+
+        self._act_convert_pose = QAction("⬡  Convert to Pose", self)
+        self._act_convert_pose.setToolTip(
+            "Convert a YOLO segmentation dataset to YOLO pose format by sampling\n"
+            "evenly-spaced keypoints from polygon contours — no model required."
+        )
+        self._act_convert_pose.triggered.connect(self._on_convert_to_pose)
 
         # ── ONNX export ───────────────────────────────────────────
         self._onnx_prec_combo = QComboBox()
@@ -738,12 +774,26 @@ class MainWindow(QMainWindow):
         v.addWidget(hint_c)
         v.addWidget(_hr())
 
+        v.addWidget(_section_lbl("Convert to Pose"))
+        v.addWidget(_tool_btn(self._act_convert_pose, _css_primary("#0f766e", hover="#0d9488")))
+        hint_cp = QLabel(
+            "Converts a segmentation dataset\n(polygons) → pose keypoints.\nNo model required."
+        )
+        hint_cp.setStyleSheet(f"color: {_MUTED}; font-size: 10px; padding: 4px 0 0 0;")
+        hint_cp.setWordWrap(True)
+        v.addWidget(hint_cp)
+        v.addWidget(_hr())
+
         v.addWidget(_section_lbl("Training"))
         v.addLayout(_row_layout("Task:", self._task_combo))
         v.addSpacing(4)
         v.addLayout(_row_layout("Model:", self._model_combo))
         v.addSpacing(4)
         v.addLayout(_row_layout("Epochs:", self._epoch_spin))
+        v.addSpacing(4)
+        v.addLayout(_row_layout("Cache:", self._cache_combo))
+        v.addSpacing(4)
+        v.addLayout(_row_layout("Workers:", self._workers_spin))
         v.addSpacing(8)
         v.addWidget(_tool_btn(self._act_train, _css_primary(_GREEN, hover="#059669")))
         hint_t = QLabel(
@@ -882,27 +932,113 @@ class MainWindow(QMainWindow):
             self._media_worker.abort()
             self._media_worker.wait()
 
-    @Slot()
-    def _on_import(self) -> None:
-        """Fresh import — clears all existing frames and annotations."""
-        path = QFileDialog.getExistingDirectory(
-            self, "Select Media Directory", _APP_ROOT
-        )
-        if not path:
-            return
+    # ──────────────────────────────────────────────────────────────
+    # Dataset structure helpers
+    # ──────────────────────────────────────────────────────────────
 
-        self._abort_media_worker()
+    def _resolve_dataset_dirs(self, path: str) -> tuple[str, str | None, str | None]:
+        """Return (images_dir, labels_dir_or_None, yaml_path_or_None).
 
-        # Clear existing session
+        Handles three common layouts:
+          1. path is the dataset root   → path/images/, path/labels/, path/data.yaml
+          2. path IS the images/ dir    → ../labels/, ../data.yaml
+          3. path is images/train/ etc. → ../../labels/train/, ../../data.yaml
+        """
+        # ── Case 1: path has an images/ subdirectory ──────────────
+        images_sub = os.path.join(path, "images")
+        if os.path.isdir(images_sub):
+            labels_dir = _first_existing(
+                os.path.join(path, "labels"),
+            )
+            yaml_path = _first_existing(os.path.join(path, "data.yaml"))
+            return images_sub, labels_dir, yaml_path
+
+        # ── Case 2: path IS images/ (or a flat image folder) — check parent ──
+        parent = os.path.dirname(path)
+        folder_name = os.path.basename(path)
+        parent_labels = os.path.join(parent, "labels")
+        if os.path.isdir(parent_labels):
+            yaml_path = _first_existing(os.path.join(parent, "data.yaml"))
+            return path, parent_labels, yaml_path
+
+        # ── Case 3: path is images/train/ — check grandparent ─────
+        grandparent = os.path.dirname(parent)
+        gp_labels_split = os.path.join(grandparent, "labels", folder_name)
+        gp_labels_flat  = os.path.join(grandparent, "labels")
+        if os.path.isdir(gp_labels_split):
+            yaml_path = _first_existing(os.path.join(grandparent, "data.yaml"))
+            return path, gp_labels_split, yaml_path
+        if os.path.isdir(gp_labels_flat):
+            yaml_path = _first_existing(os.path.join(grandparent, "data.yaml"))
+            return path, gp_labels_flat, yaml_path
+
+        # ── Fallback: plain media folder, no YOLO structure ───────
+        return path, None, None
+
+    def _apply_dataset_yaml(self, yaml_path: str) -> str:
+        """Load class names + task from data.yaml. Returns the task string."""
+        try:
+            import yaml as _yaml
+            with open(yaml_path, encoding="utf-8") as f:
+                data = _yaml.safe_load(f) or {}
+            task = data.get("task", "detect")
+            names = data.get("names", [])
+            if isinstance(names, dict):
+                names = [names[k] for k in sorted(names.keys())]
+            if isinstance(names, list) and names:
+                self.class_names = [str(n) for n in names]
+                self._class_combo.blockSignals(True)
+                self._class_combo.clear()
+                self._class_combo.addItems(self.class_names)
+                self._class_combo.blockSignals(False)
+                self._canvas.set_class_id(0)
+                self._status_label.setText(
+                    f"Loaded {len(self.class_names)} class(es) from data.yaml: "
+                    + ", ".join(self.class_names[:6])
+                    + ("…" if len(self.class_names) > 6 else "")
+                )
+            # Sync the task combo so Export YOLO uses the correct format
+            _task_index = {"detect": 0, "segment": 1, "pose": 2}.get(task, 0)
+            self._task_combo.blockSignals(True)
+            self._task_combo.setCurrentIndex(_task_index)
+            self._task_combo.blockSignals(False)
+            return task
+        except Exception as exc:
+            self._status_label.setText(f"Warning: could not read data.yaml — {exc}")
+            return "detect"
+
+    def _clear_session(self) -> None:
         self.store.clear()
         self._thumb_list.clear()
         self.current_frame_index = None
         self._canvas.load_frame("", [])
         self._frame_count = 0
         self._video_import_stride.clear()
-        self._pending_labels_dir = None
 
-        self._start_media_import([path], frame_offset=0)
+    # ──────────────────────────────────────────────────────────────
+    # Import
+    # ──────────────────────────────────────────────────────────────
+
+    @Slot()
+    def _on_import(self) -> None:
+        """Fresh import — auto-detects YOLO dataset structure and loads labels."""
+        path = QFileDialog.getExistingDirectory(
+            self, "Select Media or Dataset Directory", _APP_ROOT
+        )
+        if not path:
+            return
+
+        self._abort_media_worker()
+
+        images_dir, labels_dir, yaml_path = self._resolve_dataset_dirs(path)
+
+        self._pending_dataset_task = "detect"
+        if yaml_path:
+            self._pending_dataset_task = self._apply_dataset_yaml(yaml_path)
+        self._pending_labels_dir = labels_dir
+
+        self._clear_session()
+        self._start_media_import([images_dir], frame_offset=0)
 
     @Slot()
     def _on_add_more(self) -> None:
@@ -929,76 +1065,23 @@ class MainWindow(QMainWindow):
 
         self._abort_media_worker()
 
-        # ── Load class names from data.yaml ───────────────────────
-        # Search the picked folder and its parent for data.yaml
-        yaml_path = None
-        for candidate in (path, os.path.dirname(path)):
-            p = os.path.join(candidate, "data.yaml")
-            if os.path.isfile(p):
-                yaml_path = p
-                break
+        images_dir, labels_dir, yaml_path = self._resolve_dataset_dirs(path)
 
+        self._pending_dataset_task = "detect"
         if yaml_path:
-            try:
-                import yaml  # PyYAML
-                with open(yaml_path, encoding="utf-8") as f:
-                    data = yaml.safe_load(f)
-                names = data.get("names", [])
-
-                # YOLO data.yaml uses either a list or an int-keyed dict
-                if isinstance(names, dict):
-                    # {0: 'car', 1: 'bus', ...} — sort by key
-                    names = [names[k] for k in sorted(names.keys())]
-
-                if isinstance(names, list) and names:
-                    self.class_names = [str(n) for n in names]
-                    self._class_combo.blockSignals(True)
-                    self._class_combo.clear()
-                    self._class_combo.addItems(self.class_names)
-                    self._class_combo.blockSignals(False)
-                    self._canvas.set_class_id(0)
-                    self._status_label.setText(
-                        f"Loaded {len(self.class_names)} class(es) from data.yaml: "
-                        + ", ".join(self.class_names[:6])
-                        + ("…" if len(self.class_names) > 6 else "")
-                    )
-                else:
-                    self._status_label.setText(
-                        "data.yaml found but no class names detected — check 'names:' field"
-                    )
-            except Exception as exc:
-                self._status_label.setText(f"Warning: could not read data.yaml — {exc}")
+            self._pending_dataset_task = self._apply_dataset_yaml(yaml_path)
         else:
             self._status_label.setText(
                 "No data.yaml found — class names unchanged. "
                 "Place data.yaml in the dataset folder or its parent."
             )
-
-        # ── Resolve images dir ────────────────────────────────────
-        images_dir = os.path.join(path, "images")
-        if not os.path.isdir(images_dir):
-            # Fall back: look for train/ sub-folder inside images/
-            for candidate in ("train", "val", ""):
-                d = os.path.join(path, "images", candidate) if candidate else path
-                if os.path.isdir(d):
-                    images_dir = d
-                    break
-
-        # ── Resolve labels dir ────────────────────────────────────
-        labels_dir = os.path.join(path, "labels")
-        if not os.path.isdir(labels_dir):
-            labels_dir = None  # no labels — import images only
-
+        if labels_dir is None:
+            self._status_label.setText(
+                "No labels/ directory found — importing images only."
+            )
         self._pending_labels_dir = labels_dir
 
-        # Clear and import fresh (dataset replaces current session)
-        self.store.clear()
-        self._thumb_list.clear()
-        self.current_frame_index = None
-        self._canvas.load_frame("", [])
-        self._frame_count = 0
-        self._video_import_stride.clear()
-
+        self._clear_session()
         self._start_media_import([images_dir], frame_offset=0)
 
     def _start_media_import(self, paths: list[str], frame_offset: int) -> None:
@@ -1157,9 +1240,18 @@ class MainWindow(QMainWindow):
         )
         if not out_dir:
             return
-        is_seg = self._task_combo.currentIndex() != 0  # index 0 = Detection
-        count = export_dataset(self.store, self.class_names, out_dir, is_seg=is_seg)
-        task_label = "segmentation" if is_seg else "detection"
+        task_index = self._task_combo.currentIndex()
+        is_seg  = task_index == 1
+        is_pose = task_index == 2
+        if is_pose:
+            count = export_dataset(self.store, self.class_names, out_dir, is_pose=True)
+            task_label = "pose (4 corners: TL/TR/BR/BL)"
+        elif is_seg:
+            count = export_dataset(self.store, self.class_names, out_dir, is_seg=True)
+            task_label = "segmentation"
+        else:
+            count = export_dataset(self.store, self.class_names, out_dir)
+            task_label = "detection"
         self._status_label.setText(f"Exported {count} frames ({task_label}) to {out_dir}")
         self._update_thumbnail_colors()
         self._act_train.setEnabled(count > 0)
@@ -1169,6 +1261,8 @@ class MainWindow(QMainWindow):
         self._model_combo.clear()
         if index == 0:
             self._model_combo.addItems(DETECTION_MODELS)
+        elif index == 2:
+            self._model_combo.addItems(POSE_MODELS)
         else:
             # YOLO-based seg models first, then SAM 2 variants
             self._model_combo.addItems(SEGMENTATION_MODELS)
@@ -1208,7 +1302,8 @@ class MainWindow(QMainWindow):
             return
 
         from app.core.yolo_trainer import _is_seg_key
-        is_seg_model = _is_seg_key(model_key)
+        is_seg_model  = _is_seg_key(model_key)
+        is_pose_model = _is_pose_key(model_key)
 
         # Dataset compatibility check
         try:
@@ -1219,7 +1314,8 @@ class MainWindow(QMainWindow):
         except Exception:
             dataset_task = "detect"
 
-        is_seg_dataset = dataset_task == "segment"
+        is_seg_dataset  = dataset_task == "segment"
+        is_pose_dataset = dataset_task == "pose"
 
         if is_seg_model and not is_seg_dataset:
             reply = QMessageBox.warning(
@@ -1234,8 +1330,26 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.Cancel:
                 return
 
+        if is_pose_model and not is_pose_dataset:
+            reply = QMessageBox.warning(
+                self, "Dataset Mismatch",
+                f"'{model_key}' is a pose model, but the selected dataset "
+                f"does not have 'task: pose' in its data.yaml.\n\n"
+                f"Pose training requires keypoint labels. "
+                f"Use 'Convert to Pose' to convert a segmentation dataset first.\n\n"
+                f"Proceed anyway?",
+                QMessageBox.Ok | QMessageBox.Cancel,
+            )
+            if reply == QMessageBox.Cancel:
+                return
+
         epochs = self._epoch_spin.value()
-        metric_label = "mAP50-mask" if is_seg_model else "mAP50"
+        if is_pose_model:
+            metric_label = "mAP50-pose"
+        elif is_seg_model:
+            metric_label = "mAP50-mask"
+        else:
+            metric_label = "mAP50"
 
         self._status_label.setText(f"Training {model_key} for {epochs} epochs…")
         self._progress.setRange(0, epochs)
@@ -1243,10 +1357,16 @@ class MainWindow(QMainWindow):
         self._act_train.setEnabled(False)
         self._train_metric_label = metric_label
 
+        _cache_map = {0: False, 1: "disk", 2: "ram"}
+        _cache_val = _cache_map.get(self._cache_combo.currentIndex(), False)
+        _workers   = self._workers_spin.value()
+
         self._train_worker = YOLOTrainWorker(
             model_key=model_key,
             data_yaml=yaml_path,
             epochs=epochs,
+            cache=_cache_val,
+            workers=_workers,
         )
         self._train_worker.epoch_done.connect(self._on_epoch_done)
         self._train_worker.finished.connect(self._on_train_finished)
@@ -1369,6 +1489,79 @@ class MainWindow(QMainWindow):
         )
 
     # ──────────────────────────────────────────────────────────────
+    # Pose converter
+    # ──────────────────────────────────────────────────────────────
+
+    @Slot()
+    def _on_convert_to_pose(self) -> None:
+        source_path = QFileDialog.getExistingDirectory(
+            self, "Select Segmentation Dataset (contains data.yaml)",
+            _APP_ROOT
+        )
+        if not source_path:
+            return
+
+        margin_pct, ok = QInputDialog.getDouble(
+            self, "Edge Margin",
+            "Remove keypoints within N% of any image edge\n"
+            "(corners near the border are partially out of frame):",
+            2.0, 0.0, 49.0, 1,
+        )
+        if not ok:
+            return
+        edge_margin = margin_pct / 100.0
+
+        source_dir  = os.path.normpath(source_path)
+        parent_dir  = os.path.dirname(source_dir)
+        folder_name = os.path.basename(source_dir)
+        output_dir  = os.path.join(parent_dir, folder_name + "pose")
+
+        if self._pose_converter_worker and self._pose_converter_worker.isRunning():
+            return
+
+        from app.core.yolo_pose_converter import YoloPoseConverterWorker
+
+        self._status_label.setText("Starting pose conversion…")
+        self._progress.setRange(0, 0)
+
+        self._pose_converter_worker = YoloPoseConverterWorker(
+            source_root=source_dir,
+            output_root=output_dir,
+            edge_margin=edge_margin,
+        )
+        self._pose_converter_worker.progress.connect(self._on_pose_convert_progress)
+        self._pose_converter_worker.status_update.connect(self._status_label.setText)
+        self._pose_converter_worker.finished.connect(self._on_pose_convert_finished)
+        self._pose_converter_worker.error.connect(self._on_worker_error)
+        self._pose_converter_worker.start()
+
+    @Slot(int, int)
+    def _on_pose_convert_progress(self, current: int, total: int) -> None:
+        if total > 0:
+            self._progress.setRange(0, total)
+            self._progress.setValue(current)
+            pct = int(current / total * 100)
+            self._status_label.setText(
+                f"Converting to pose: {pct}%  ({current}/{total} images)"
+            )
+
+    @Slot(dict)
+    def _on_pose_convert_finished(self, result: dict) -> None:
+        self._progress.setRange(0, 100)
+        self._progress.setValue(100)
+        summary = (
+            f"Pose conversion complete — {result['converted_items']} converted, "
+            f"{result['fallback_items']} bbox fallback, "
+            f"{result['failed_items']} failed  "
+            f"({result['time_taken_sec']:.1f}s)  [4 corners: TL/TR/BR/BL]"
+        )
+        self._status_label.setText(summary)
+        QMessageBox.information(
+            self, "Pose Conversion Complete",
+            f"{summary}\n\nOutput: {result['output_dir']}"
+        )
+
+    # ──────────────────────────────────────────────────────────────
     # Worker slots — media loader
     # ──────────────────────────────────────────────────────────────
 
@@ -1422,8 +1615,11 @@ class MainWindow(QMainWindow):
 
         # If importing a YOLO dataset, apply existing label annotations now
         if self._pending_labels_dir and os.path.isdir(self._pending_labels_dir):
-            labeled = self._apply_dataset_labels(self._pending_labels_dir)
+            labeled = self._apply_dataset_labels(
+                self._pending_labels_dir, self._pending_dataset_task
+            )
             self._pending_labels_dir = None
+            self._pending_dataset_task = "detect"
             # Reload canvas so boxes appear without requiring a click
             if self.current_frame_index is not None:
                 self._reload_canvas(self.current_frame_index)
@@ -1439,13 +1635,18 @@ class MainWindow(QMainWindow):
         # Auto-advance to the Annotate tab
         self._switch_tab(self._TAB_ANNOTATE)
 
-    def _apply_dataset_labels(self, labels_dir: str) -> int:
+    def _apply_dataset_labels(self, labels_dir: str, dataset_task: str = "detect") -> int:
         """
         Parse YOLO .txt label files and populate BBoxes in the store.
+
+        Handles detection, segmentation, and pose formats based on dataset_task.
         Returns the number of frames that had labels applied.
         """
         import cv2 as _cv2
         labeled = 0
+        is_pose = dataset_task == "pose"
+        is_seg  = dataset_task == "segment"
+
         for frame_index, ann in self.store.items():
             # Recover original image path stored in _on_frame_ready
             orig_path = ann.__dict__.get("_orig_image_path", "")
@@ -1473,8 +1674,27 @@ class MainWindow(QMainWindow):
                     except ValueError:
                         continue
 
-                    # Segmentation format: class_id + even number of xy pairs (≥3 pts)
-                    if len(floats) >= 6 and len(floats) % 2 == 0:
+                    n = len(floats)
+
+                    # ── Pose format: cx cy w h  x1 y1 v1  x2 y2 v2 ... ───────
+                    # 4 bbox values + N*3 keypoint values (N ≥ 2)
+                    if is_pose and n >= 10 and (n - 4) % 3 == 0:
+                        cx, cy, bw, bh = floats[:4]
+                        x1 = (cx - bw / 2) * w
+                        y1 = (cy - bh / 2) * h
+                        x2 = (cx + bw / 2) * w
+                        y2 = (cy + bh / 2) * h
+                        kpt_raw = floats[4:]
+                        keypoints = [
+                            (kpt_raw[i], kpt_raw[i + 1]) if kpt_raw[i + 2] > 0 else None
+                            for i in range(0, len(kpt_raw), 3)
+                        ]
+                        boxes.append(BBox(x1=x1, y1=y1, x2=x2, y2=y2,
+                                          class_id=cid, source="dataset",
+                                          keypoints=keypoints or None))
+
+                    # ── Segmentation format: class_id + even xy pairs (≥ 3 pts) ─
+                    elif (is_seg or not is_pose) and n >= 6 and n % 2 == 0:
                         xs = floats[0::2]
                         ys = floats[1::2]
                         x1 = min(xs) * w
@@ -1484,8 +1704,9 @@ class MainWindow(QMainWindow):
                         boxes.append(BBox(x1=x1, y1=y1, x2=x2, y2=y2,
                                           class_id=cid, source="dataset",
                                           polygon=floats))
-                    elif len(floats) == 4:
-                        # Detection format: cx cy w h
+
+                    # ── Detection format: cx cy w h ───────────────────────────
+                    elif n == 4:
                         cx, cy, bw, bh = floats
                         x1 = (cx - bw / 2) * w
                         y1 = (cy - bh / 2) * h
@@ -1493,6 +1714,7 @@ class MainWindow(QMainWindow):
                         y2 = (cy + bh / 2) * h
                         boxes.append(BBox(x1=x1, y1=y1, x2=x2, y2=y2,
                                           class_id=cid, source="dataset"))
+
             if boxes:
                 ann.boxes = boxes
                 ann.status = "verified"
@@ -2027,7 +2249,7 @@ class MainWindow(QMainWindow):
             self._media_worker, self._train_worker,
             self._sam_load_worker, self._sam_text_worker,
             self._sam_prompt_worker, self._sam_track_worker,
-            self._seg_converter_worker,
+            self._seg_converter_worker, self._pose_converter_worker,
         ):
             if worker and worker.isRunning():
                 if hasattr(worker, "abort"):
