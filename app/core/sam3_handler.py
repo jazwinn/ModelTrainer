@@ -23,6 +23,8 @@ from typing import Callable
 import numpy as np
 from PIL import Image
 
+from app.core import maskops
+
 
 # ---------------------------------------------------------------------------
 # Shared data model
@@ -222,12 +224,18 @@ def run_sam3(
     neg_boxes: list[tuple[float, float, float, float]] | None = None,
     class_id: int = 0,
     threshold: float = 0.5,
+    want_masks: bool = False,
+    detail: str = maskops.DEFAULT_DETAIL,
 ) -> list[BBox]:
     """
     Run SAM 3 concept segmentation on a single image.
 
     Returns one BBox per matching instance.  Requires at least a text prompt
     or one positive exemplar box (otherwise SAM 3 has no concept to find).
+
+    With *want_masks* each box also carries the outline of its mask, which is
+    what a segmentation label needs.  The model computes those masks either
+    way, so this only decides whether they are kept.
     """
     import torch
 
@@ -267,14 +275,19 @@ def run_sam3(
         outputs, threshold=threshold, mask_threshold=0.5, target_sizes=target_sizes,
     )[0]
 
-    return _results_to_boxes(results, W, H, class_id)
+    return _results_to_boxes(results, W, H, class_id,
+                             want_masks=want_masks, detail=detail)
 
 
-def _results_to_boxes(results, W: int, H: int, class_id: int) -> list[BBox]:
+def _results_to_boxes(
+    results, W: int, H: int, class_id: int,
+    *, want_masks: bool = False, detail: str = maskops.DEFAULT_DETAIL,
+) -> list[BBox]:
     boxes = results.get("boxes")
     if boxes is None:
         return []
     scores = results.get("scores")
+    masks = results.get("masks") if want_masks else None
 
     out: list[BBox] = []
     for i, box in enumerate(boxes):
@@ -291,8 +304,18 @@ def _results_to_boxes(results, W: int, H: int, class_id: int) -> list[BBox]:
                 score = round(float(scores[i]), 4)
             except Exception:
                 score = None
+        polygon = None
+        if masks is not None and i < len(masks):
+            polygon = maskops.mask_to_polygon(
+                maskops.to_bool_mask(masks[i], W, H), W, H, detail=detail
+            )
+            if polygon:
+                # The outline is the truth for a segmentation label, so keep the
+                # box consistent with it rather than with the model's own box.
+                x1, y1, x2, y2 = maskops.polygon_bounds(polygon, W, H)
+
         out.append(BBox(x1=x1, y1=y1, x2=x2, y2=y2, class_id=class_id,
-                        source="sam", score=score))
+                        source="sam", score=score, polygon=polygon))
     return out
 
 
@@ -307,6 +330,8 @@ def run_concepts_over_frames(
     concepts: list[tuple[str, int]],
     *,
     threshold: float = 0.5,
+    want_masks: bool = False,
+    detail: str = maskops.DEFAULT_DETAIL,
     on_boxes: Callable[[int, list[BBox]], None],
     on_progress: Callable[[int, int], None] | None = None,
     should_abort: Callable[[], bool] | None = None,
@@ -340,6 +365,7 @@ def run_concepts_over_frames(
                 boxes.extend(run_sam3(
                     model, processor, pil_img,
                     text=text, class_id=class_id, threshold=threshold,
+                    want_masks=want_masks, detail=detail,
                 ))
             on_boxes(frame_index, boxes)
         except Exception as exc:
@@ -351,6 +377,57 @@ def run_concepts_over_frames(
     return processed
 
 
+def segment_box(
+    model,
+    processor,
+    pil_img: Image.Image,
+    box: tuple[float, float, float, float],
+    *,
+    detail: str = maskops.DEFAULT_DETAIL,
+) -> tuple[list[float] | None, tuple[float, float, float, float] | None]:
+    """
+    Outline the one object inside *box*.
+
+    This uses the memory tracker rather than the concept model, because the two
+    answer different questions: a box handed to the concept model means "find
+    more things like this" and comes back with every loose match, while the
+    tracker segments the object you actually drew around.  Run on a one-frame
+    video, it is the classic click-and-snap segmenter.
+
+    Returns (polygon, bounds) in normalised / pixel form, or (None, None) when
+    there is nothing to outline.
+    """
+    import torch
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    width, height = pil_img.size
+
+    session = processor.init_video_session(video=[pil_img], inference_device=device)
+    processor.add_inputs_to_inference_session(
+        inference_session=session,
+        frame_idx=0,
+        obj_ids=[1],
+        input_boxes=[[[float(box[0]), float(box[1]), float(box[2]), float(box[3])]]],
+    )
+
+    with torch.inference_mode():
+        out = model(session, frame_idx=0)
+
+    res = processor.post_process_masks(
+        [out.pred_masks],
+        original_sizes=[[session.video_height, session.video_width]],
+        binarize=True,
+    )[0]
+    if res.shape[0] == 0:
+        return None, None
+
+    mask = res[0, 0].cpu().numpy().astype(bool)
+    polygon = maskops.mask_to_polygon(mask, width, height, detail=detail)
+    if not polygon:
+        return None, None
+    return polygon, maskops.polygon_bounds(polygon, width, height)
+
+
 def track_through_frames(
     model,
     processor,
@@ -359,6 +436,8 @@ def track_through_frames(
     start_frame_index: int,
     *,
     max_frames: int | None = None,
+    want_masks: bool = False,
+    detail: str = maskops.DEFAULT_DETAIL,
     on_boxes: Callable[[int, list[BBox]], None],
     on_progress: Callable[[int, int], None] | None = None,
     should_abort: Callable[[], bool] | None = None,
@@ -448,7 +527,15 @@ def track_through_frames(
                     continue
                 oid = session_obj_ids[i] if i < len(session_obj_ids) else None
                 x1, y1, x2, y2 = bb
-                boxes.append(BBox(x1=x1, y1=y1, x2=x2, y2=y2,
+                # The tracker already produces a mask per object, so tracking a
+                # segmentation dataset costs nothing extra.
+                polygon = None
+                if want_masks:
+                    height, width = mask.shape[:2]
+                    polygon = maskops.mask_to_polygon(mask, width, height, detail=detail)
+                    if polygon:
+                        x1, y1, x2, y2 = maskops.polygon_bounds(polygon, width, height)
+                boxes.append(BBox(x1=x1, y1=y1, x2=x2, y2=y2, polygon=polygon,
                                   class_id=objid_to_class.get(oid, 0), source="sam"))
 
             on_boxes(frame_index, boxes)

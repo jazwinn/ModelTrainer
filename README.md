@@ -71,6 +71,10 @@ and a folded section still shows what it is set to.
 | **Reuse this frame's labels** | Turns the classes on this frame into search terms for all the other frames | Photo sets and changing scenes, where each frame stands alone |
 | **Track through the video** | Follows the exact objects you boxed into the frames that follow | Continuous video of the same moving objects (import at stride 1) |
 
+**What you are labelling** sits at the top of the panel — *Boxes*, *Outlines* or *Corner
+points*. It decides which tools you get, what auto-labelling records, and the format
+Export writes, so it is the one switch to set before you start.
+
 Three settings sit under the methods and apply to all of them:
 
 * **Model** — SAM 3.1 (recommended) or SAM 3.
@@ -85,6 +89,7 @@ Press `?` in the app for this list at any time; the tool buttons carry their key
 | Keys | |
 |------|--|
 | `V` `B` `E` `X` | Select · Draw box · Example · Exclude |
+| `P` · `G` | Trace an outline · snap one to an object (when labelling outlines) |
 | Click · `Shift`-click | Select a box · add it to the selection, or take it out |
 | Drag on empty space | Lasso every box the rectangle touches |
 | `Ctrl+A` · `Esc` | Select every box on the frame · select nothing |
@@ -111,11 +116,38 @@ will touch. Clearing a single frame stays undoable in the editor; clearing sever
 first, because it cannot be undone. Dropping frames removes them from the session only —
 the original files on disk are untouched.
 
-Boxes are coloured by class. A **dashed** outline means SAM suggested it and nobody has
-looked yet; a **solid** one means a human drew or adjusted it. Pose keypoints show as
+Boxes are coloured by class. A **dashed** line means SAM suggested it and nobody has
+looked yet; a **solid** one means a human drew or adjusted it. When an object carries an
+outline, the rectangle around it is drawn **green** — the outline keeps the class colour,
+so the shape and the box that wraps it never read as one line. Pose keypoints show as
 numbered corner dots — drag to move, right-click to remove, right-click a ghost to bring
 it back. **Mark reviewed** records that you have checked a frame, which the exporter can
 then filter on.
+
+#### Outlines (segmentation)
+
+Set **What you are labelling** to *Outlines* and two more tools appear:
+
+| Tool | |
+|------|--|
+| **Snap** (`G`) | Drag a rough box around one object; SAM fits the outline to what is inside it. The box only has to be close — the outline lands on the object. |
+| **Outline** (`P`) | Trace by hand, point by point. Click the first point or press `Enter` to close, right-click to take back a point, `Esc` to abandon it. |
+
+Every auto-label method records outlines too, at no extra cost — SAM computes a mask for
+each object it finds either way, so *Describe what to find*, *Reuse this frame's labels*
+and *Track through the video* all produce real shapes rather than rectangles.
+
+Select an outline and its points appear. Drag a point to move it, click an edge to add
+one, right-click a point to remove it. The bounding box follows the outline, so it is
+always correct. **Outline detail** controls how closely a shape follows the mask —
+*Coarse* collapses a panel to its four corners, *Fine* keeps every wobble. Fewer points
+mean smaller labels and faster training, so prefer the coarsest setting that still traces
+the object.
+
+Export writes standard YOLO segmentation labels: one polygon per object. That means one
+outline per object — a shape with a hole, or one that breaks into pieces, keeps its
+largest part. **Boxes → masks** in the Train step is still there for datasets labelled
+elsewhere, but you no longer need it for anything labelled here.
 
 #### Merging boxes
 
@@ -140,7 +172,7 @@ nothing is clipped. Pose keypoints become the four corners of the merged box.
 |--------|--------------|
 | **Export a dataset** | Writes `images/`, `labels/` and `data.yaml` for detection, segmentation or pose |
 | **Train a model** | YOLOv8 / 11 / 12 / 26, FastSAM or SAM 2 fine-tuning, with image size, cache mode and worker count exposed |
-| **Boxes → masks** | Upgrades a detection dataset to polygon masks using SAM 3 — no re-labelling |
+| **Boxes → masks** | Upgrades a detection dataset that was labelled elsewhere to polygon masks using SAM 3 |
 | **Masks → 4 corner points** | Converts polygons to pose keypoints geometrically; no model, seconds to run |
 | **Export to ONNX** | Converts a trained `.pt` to ONNX at FP32 or FP16, dynamic or static shape |
 
@@ -176,6 +208,7 @@ app/
     session.py         the session: frames, classes, models, jobs
     jobs.py            background jobs with progress and cancellation
     boxops.py          merging boxes, by hand and by overlap
+    maskops.py         SAM masks → the outlines a seg label needs
     media_loader.py    images and video → frames
     sam3_handler.py    SAM 3 concept segmentation and video tracking
     yolo_trainer.py    Ultralytics training (stoppable mid-run)

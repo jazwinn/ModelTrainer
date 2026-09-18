@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from app.core.jobs import Job
 from app.core.sam3_handler import BBox, SAM_MODELS
 from app.core.sam2_trainer import SAM2_MODELS, train_sam2
+from app.core import maskops
 from app.core.session import MERGE, REPLACE, SKIP, TASKS, Session
 from app.core.yolo_trainer import (
     DETECTION_MODELS, POSE_MODELS, RUNS_DIR, SEGMENTATION_MODELS, _PROJECT_ROOT,
@@ -166,6 +167,9 @@ def _state(request: Request | None = None) -> dict:
         "samModel": session.sam_model_key,
         "samModels": list(SAM_MODELS),
         "threshold": session.threshold,
+        "maskDetail": session.mask_detail,
+        "maskDetails": list(maskops.DETAIL_LEVELS),
+        "wantsMasks": session.wants_masks,
         "frames": session.frames_meta(),
         "jobs": session.jobs.snapshot(),
         "stats": session.stats(),
@@ -197,9 +201,14 @@ async def set_settings(payload: dict = Body(...)) -> dict:
         session.sam_model_key = payload["samModel"]
     if "threshold" in payload:
         session.threshold = max(0.05, min(0.95, float(payload["threshold"])))
+    if payload.get("maskDetail") in maskops.DETAIL_LEVELS:
+        session.mask_detail = payload["maskDetail"]
     session.touch()
+    if "task" in payload:
+        session.emit({"type": "task", "task": session.task})
     return {"task": session.task, "samModel": session.sam_model_key,
-            "threshold": session.threshold}
+            "threshold": session.threshold, "maskDetail": session.mask_detail,
+            "wantsMasks": session.wants_masks}
 
 
 @app.post("/api/classes")
@@ -453,7 +462,7 @@ def _policy(payload: dict) -> str:
 
 
 def _reject_if_busy() -> None:
-    busy = session.jobs.is_busy("autolabel", "track", "prompt")
+    busy = session.jobs.is_busy("autolabel", "track", "prompt", "snap")
     if busy:
         raise HTTPException(409, f"{busy.label} is still running — stop it first.")
 
@@ -543,6 +552,21 @@ async def autolabel_track(payload: dict = Body(...)) -> dict:
     try:
         job = session.start_tracking(seed_index, max_frames=max_frames, policy=_policy(payload))
     except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"job": job.to_dict()}
+
+
+@app.post("/api/autolabel/snap")
+async def autolabel_snap(payload: dict = Body(...)) -> dict:
+    """Fit an outline to the object inside a drawn box."""
+    _reject_if_busy()
+    try:
+        job = session.snap_to_object(
+            int(payload.get("frame", -1)),
+            [float(v) for v in payload.get("box", [])],
+            class_id=int(payload.get("classId", 0)),
+        )
+    except (ValueError, TypeError) as exc:
         raise HTTPException(400, str(exc))
     return {"job": job.to_dict()}
 

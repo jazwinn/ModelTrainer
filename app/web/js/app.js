@@ -137,6 +137,12 @@ app.setSearchClass = (id) => {
 
 app.reloadFrame = () => reloadCurrentFrame();
 
+app.onTaskChange = () => {
+  syncMaskTools();
+  renderHud();
+  app.renderPanel();
+};
+
 app.clearExamples = () => {
   app.editor.clearExamples();
   app.examples = { positive: [], negative: [] };
@@ -483,7 +489,15 @@ async function flushSave() {
 
 // ── Tools & HUD ────────────────────────────────────────────────
 
+function maskMode() {
+  return app.state.task === 'segment';
+}
+
 function setTool(tool) {
+  if ((tool === 'outline' || tool === 'snap') && !maskMode()) {
+    toast('Switch “What you are labelling” to Outlines first.', 'warn');
+    return;
+  }
   app.editor.setTool(tool);
   for (const btn of dom.tools.querySelectorAll('.tool')) {
     btn.setAttribute('aria-pressed', btn.dataset.tool === tool ? 'true' : 'false');
@@ -491,16 +505,35 @@ function setTool(tool) {
   renderHud();
 }
 
+/** Outline and Snap are meaningless for box or pose datasets, so they hide. */
+function syncMaskTools() {
+  const masks = maskMode();
+  for (const btn of dom.tools.querySelectorAll('.tool-mask')) btn.hidden = !masks;
+  if (!masks && (app.editor?.tool === 'outline' || app.editor?.tool === 'snap')) {
+    setTool('select');
+  }
+}
+
 function renderHud() {
   const notes = [];
   const tool = app.editor?.tool;
-  if (tool === 'pos') {
+  if (tool === 'outline') {
+    const points = app.editor.pending?.length || 0;
+    notes.push({
+      kind: 'info',
+      html: points
+        ? `<b>${points} point${points === 1 ? '' : 's'}.</b> Click the first point or press Enter to close · right-click undoes a point · Esc starts over.`
+        : '<b>Outline mode.</b> Click around the object, point by point. Close it on the first point or with Enter.',
+    });
+  } else if (tool === 'snap') {
+    notes.push({ kind: 'info', html: '<b>Snap mode.</b> Drag a rough box around one object and SAM fits the outline to it.' });
+  } else if (tool === 'pos') {
     notes.push({ kind: 'pos', html: '<b>Example mode.</b> Drag a box around one object you want SAM 3 to find.' });
   } else if (tool === 'neg') {
     notes.push({ kind: 'neg', html: '<b>Exclude mode.</b> Drag around anything that should not be matched.' });
-  } else if (tool === 'draw') {
-    notes.push({ kind: 'info', html: '<b>Draw mode.</b> Drag to add a box. Press V to go back to selecting.' });
   }
+  // Draw mode gets no note: the lit tool button says it, and the note sat over
+  // the top-left of the picture, which is exactly where boxes tend to go.
   const { positive, negative } = app.examples;
   if (positive.length || negative.length) {
     notes.push({
@@ -520,8 +553,18 @@ const SHORTCUTS = [
   ['Tools', [
     ['V', 'Select and edit boxes'],
     ['B', 'Draw a box'],
+    ['P', 'Trace an outline point by point (mask labelling)'],
+    ['G', 'Snap an outline to the object in a rough box (mask labelling)'],
     ['E', 'Mark an example for SAM 3 to match'],
     ['X', 'Mark something to exclude'],
+  ]],
+  ['Outlines', [
+    ['Click · Enter', 'Drop a point · close the outline you are tracing'],
+    ['Right-click', 'Take back the last point while tracing'],
+    ['Esc', 'Abandon the outline you are tracing'],
+    ['Drag a point', 'Move it — the box follows the outline'],
+    ['Click an edge', 'Add a point there'],
+    ['Right-click a point', 'Remove it'],
   ]],
   ['Selecting', [
     ['Click', 'Select one box'],
@@ -636,6 +679,11 @@ function onJobFinished(job) {
       ? `${plural(r.objects, 'match', 'matches')} added to this frame.`
       : 'No matches — try another example box, or lower the confidence.',
       r.objects ? 'ok' : 'warn', 'Search complete');
+  } else if (job.kind === 'snap') {
+    toast(r.objects
+      ? `Outline added — ${plural(r.points || 0, 'point')}.`
+      : 'Nothing to outline there. Draw the box a little tighter around the object.',
+      r.objects ? 'ok' : 'warn', 'Snap');
   } else if (job.kind === 'train') {
     const where = r.best || r.save_dir || '';
     toast(where ? `Weights saved to ${where}` : 'Training finished.', 'ok', 'Training complete');
@@ -659,7 +707,7 @@ function handleEvent(msg) {
       if (msg.event === 'finished') {
         onJobFinished(job);
         setTimeout(() => { app.jobs.delete(job.id); app.jobLogs.delete(job.id); renderJobs(); }, 600);
-        if (['autolabel', 'track', 'prompt'].includes(job.kind)) {
+        if (['autolabel', 'track', 'prompt', 'snap'].includes(job.kind)) {
           reloadCurrentFrame();
           refreshStats();
         }
@@ -713,6 +761,8 @@ function handleEvent(msg) {
       break;
     case 'task':
       app.state.task = msg.task;
+      syncMaskTools();
+      renderHud();
       app.renderPanel();
       break;
     case 'toast':
@@ -771,6 +821,7 @@ function applyState(state) {
   renderClassSelect();
   renderStrip();
   renderDevice();
+  syncMaskTools();
   for (const job of state.jobs || []) app.jobs.set(job.id, job);
   renderJobs();
   if (app.currentIndex === null && state.frames.length) {
@@ -866,12 +917,17 @@ function bind() {
       case 'ArrowRight': case 'ArrowDown': e.preventDefault(); step(1, e.shiftKey); break;
       case 'Delete': case 'Backspace': app.editor.deleteSelected(); break;
       case 'v': case 'V': setTool('select'); break;
+      case 'p': case 'P': setTool('outline'); break;
+      case 'g': case 'G': setTool('snap'); break;
+      case 'Enter': if (app.editor.pending) { e.preventDefault(); app.editor.finishOutline(); } break;
       case 'b': case 'B': setTool('draw'); break;
       case 'e': case 'E': setTool('pos'); break;
       case 'x': case 'X': setTool('neg'); break;
       case 'f': case 'F': app.editor.fit(); break;
       case 'm': case 'M': mergeSelected(); break;
-      case 'Escape': app.editor.select(null); break;
+      case 'Escape':
+        if (!app.editor.cancelOutline()) app.editor.select(null);
+        break;
       case '?': showShortcuts(); break;
       case ' ':
         e.preventDefault();
@@ -908,6 +964,19 @@ async function main() {
     }
     updateSelectionInfo();
   };
+  app.editor.onSnap = async (rect) => {
+    if (app.currentIndex === null) return;
+    try {
+      await api.snap({
+        frame: app.currentIndex,
+        box: [rect.x1, rect.y1, rect.x2, rect.y2],
+        classId: app.ui.classId,
+      });
+    } catch (err) {
+      toast(err.message, 'error', 'Could not outline');
+    }
+  };
+
   app.editor.onExemplars = (positive, negative) => {
     app.examples = {
       positive: positive.map((r) => [r.x1, r.y1, r.x2, r.y2]),

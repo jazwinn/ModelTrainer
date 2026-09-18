@@ -292,6 +292,8 @@ button, select, input, textarea { font:inherit; color:inherit; }
 .tool[aria-pressed="true"] { background:var(--accent); border-color:var(--accent); color:#0f1218; }
 .tool-pos[aria-pressed="true"] { background:var(--ok); border-color:var(--ok); }
 .tool-neg[aria-pressed="true"] { background:var(--danger); border-color:var(--danger); color:#fff; }
+/* Outline and Snap only appear when you are labelling masks. */
+.tool-mask[hidden] { display:none !important; }
 
 kbd {
   font-family:var(--font);
@@ -399,10 +401,20 @@ kbd {
   background:var(--ink-850);
   border-left:1px solid var(--line-soft);
   overflow-y:auto;
-  padding:14px;
+  /* No bottom padding here on purpose: a flex scroll container drops it from
+     the scrollable area, which leaves the last control unreachable. */
+  padding:14px 14px 0;
+  display:flex;
+  flex-direction:column;
+}
+
+.panel-inner {
   display:flex;
   flex-direction:column;
   gap:14px;
+  /* Room to scroll past the last control — it also has to clear the job bar,
+     which floats over the foot of the window while work is running. */
+  padding-bottom:96px;
 }
 
 .block { display:flex; flex-direction:column; gap:9px; }
@@ -607,9 +619,11 @@ select.mini, input.mini { padding:4px 7px; font-size:12px; width:auto; }
 
 .jobbar {
   position:fixed;
-  left:50%; bottom:16px;
-  transform:translateX(-50%);
-  width:min(760px, calc(100vw - 32px));
+  bottom:16px;
+  /* Spans the canvas only: floating over the filmstrip or the controls would
+     put a progress bar on top of the buttons you are trying to press. */
+  left:calc(var(--strip-w) + 16px);
+  right:calc(var(--panel-w) + 16px);
   background:var(--ink-800);
   border:1px solid var(--line);
   border-radius:var(--r-md);

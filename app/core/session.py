@@ -19,12 +19,12 @@ import threading
 import time
 from typing import Callable, Iterable
 
-from app.core import boxops, media_loader
+from app.core import boxops, maskops, media_loader
 from app.core.jobs import Job, JobManager
 from app.core.sam3_handler import (
     AnnotationStore, BBox, FrameAnnotation, SAM_MODELS,
     load_sam3, load_sam3_tracker, run_concepts_over_frames, run_sam3,
-    track_through_frames,
+    segment_box, track_through_frames,
 )
 from app.core.yolo_trainer import _PROJECT_ROOT
 
@@ -50,6 +50,7 @@ class Session:
         self.task: str = "detect"
         self.sam_model_key: str = next(iter(SAM_MODELS))
         self.threshold: float = 0.5
+        self.mask_detail: str = maskops.DEFAULT_DETAIL
 
         self._emit = emit
         self.jobs = JobManager()
@@ -125,6 +126,7 @@ class Session:
                 "task": self.task,
                 "sam_model_key": self.sam_model_key,
                 "threshold": self.threshold,
+                "mask_detail": self.mask_detail,
                 "video_stride": self.video_stride,
                 "frames": [ann.to_dict() for ann in self.store.values()],
             }
@@ -150,6 +152,7 @@ class Session:
             self.task = data.get("task", "detect")
             self.sam_model_key = data.get("sam_model_key", self.sam_model_key)
             self.threshold = float(data.get("threshold", 0.5))
+            self.mask_detail = data.get("mask_detail", maskops.DEFAULT_DETAIL)
             self.video_stride = {k: int(v) for k, v in (data.get("video_stride") or {}).items()}
             self.store = {f.frame_index: f for f in frames}
         self._dirty = False
@@ -330,6 +333,11 @@ class Session:
     # ──────────────────────────────────────────────────────────────
     # Models
     # ──────────────────────────────────────────────────────────────
+
+    @property
+    def wants_masks(self) -> bool:
+        """Segmentation labels need outlines; the other tasks do not."""
+        return self.task == "segment"
 
     def cached_sam(self):
         """The already-loaded SAM 3 model, if any — never triggers a load."""
@@ -580,6 +588,7 @@ class Session:
             run_concepts_over_frames(
                 model, processor, frames, concepts,
                 threshold=threshold,
+                want_masks=self.wants_masks, detail=self.mask_detail,
                 on_boxes=on_boxes,
                 on_progress=lambda cur, tot: job.set_progress(
                     cur, tot, f"{cur} / {tot} frames · {hits['boxes']} objects found"
@@ -625,6 +634,7 @@ class Session:
             tracked = track_through_frames(
                 model, processor, frames, seeds, seed_index,
                 max_frames=max_frames,
+                want_masks=self.wants_masks, detail=self.mask_detail,
                 on_boxes=on_boxes,
                 on_progress=lambda cur, tot: job.set_progress(
                     cur, tot, f"{cur} / {tot} frames · {count['n']} objects tracked"
@@ -672,12 +682,54 @@ class Session:
                 neg_boxes=[tuple(b) for b in neg],
                 class_id=class_id,
                 threshold=threshold,
+                want_masks=self.wants_masks, detail=self.mask_detail,
             )
             self.apply_auto_boxes(frame_index, boxes, policy)
             self.save_state()
             return {"objects": len(boxes), "frame": frame_index}
 
         return self.jobs.start("prompt", f"Finding matches on frame {frame_index}", work)
+
+    def snap_to_object(
+        self,
+        frame_index: int,
+        box: list[float],
+        *,
+        class_id: int = 0,
+    ) -> Job:
+        """Fit an outline to the object inside a drawn box.
+
+        The box only has to be roughly right — the tracker segments what sits
+        inside it, so the outline lands on the object rather than on the box.
+        """
+        ann = self.store.get(frame_index)
+        if ann is None:
+            raise ValueError(f"Frame {frame_index} is not loaded.")
+        if len(box) != 4 or box[2] - box[0] < 2 or box[3] - box[1] < 2:
+            raise ValueError("Drag a box around the object you want outlined.")
+
+        def work(job: Job) -> dict:
+            from PIL import Image
+
+            model, processor = self.ensure_tracker(job)
+            job.raise_if_cancelled()
+            job.set_message("Fitting an outline…")
+
+            pil = Image.open(ann.image_path).convert("RGB")
+            polygon, bounds = segment_box(
+                model, processor, pil, tuple(box), detail=self.mask_detail
+            )
+            if not polygon or not bounds:
+                return {"objects": 0, "frame": frame_index, "missed": True}
+
+            x1, y1, x2, y2 = bounds
+            outlined = BBox(x1=x1, y1=y1, x2=x2, y2=y2, class_id=class_id,
+                            source="sam", polygon=polygon)
+            self.apply_auto_boxes(frame_index, [outlined], MERGE)
+            self.save_state()
+            return {"objects": 1, "frame": frame_index, "points": len(polygon) // 2}
+
+        return self.jobs.start("snap", f"Outlining an object on frame {frame_index}", work)
 
     # ──────────────────────────────────────────────────────────────
     # Stats

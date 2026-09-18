@@ -238,6 +238,43 @@ export function labelPanel(app) {
       el('span', { text: name }),
     ])));
 
+  const taskNames = { detect: 'Boxes', segment: 'Outlines', pose: 'Corner points' };
+  const task = select([
+    ['detect', 'Boxes — a rectangle per object'],
+    ['segment', 'Outlines — the shape of each object'],
+    ['pose', 'Corner points — four points per object'],
+  ], app.state.task);
+  task.addEventListener('change', async () => {
+    await api.settings({ task: task.value });
+    app.state.task = task.value;
+    app.onTaskChange();
+  });
+
+  const detailSelect = select(
+    (app.state.maskDetails || ['coarse', 'medium', 'fine']).map((d) => [d, {
+      coarse: 'Coarse — straight edges, fewest points',
+      medium: 'Medium — follows most shapes',
+      fine: 'Fine — keeps every wobble',
+    }[d] || d]),
+    app.state.maskDetail || 'medium',
+  );
+  detailSelect.addEventListener('change', () => api.settings({ maskDetail: detailSelect.value }));
+
+  const taskBlock = disclosure(app, {
+    id: 'task',
+    title: 'What you are labelling',
+    summary: taskNames[app.state.task] || app.state.task,
+    defaultOpen: true,
+    children: [
+      task,
+      app.state.task === 'segment' ? field('Outline detail', detailSelect,
+        'How closely an outline follows the mask. Panels and other straight-edged things need only a few points.') : null,
+      app.state.task === 'segment'
+        ? el('p', { class: 'block-note', text: 'Auto-label and tracking now record outlines, and the Outline and Snap tools appear in the toolbar.' })
+        : el('p', { class: 'block-note', text: 'This drives both the tools you get and the format Export writes.' }),
+    ].filter(Boolean),
+  });
+
   const classBlock = disclosure(app, {
     id: 'classes',
     title: 'Classes',
@@ -289,13 +326,22 @@ export function labelPanel(app) {
   const methods = el('div', { class: 'methods' },
     METHODS.map((method) => methodCard(app, method, { frame, detail, boxCount })));
 
-  return el('div', { class: 'panel-inner' }, [
-    classBlock,
-    el('div', { class: 'block' }, [
-      el('h3', {}, ['Label automatically']),
+  const chosen = METHODS.find((m) => m.id === app.ui.method);
+  const methodBlock = disclosure(app, {
+    id: 'autolabel',
+    title: 'Label automatically',
+    summary: chosen ? chosen.title : '',
+    defaultOpen: true,
+    children: [
       el('p', { class: 'block-note', text: 'Pick one way to work. Each one runs on its own and can be stopped at any time.' }),
       methods,
-    ]),
+    ],
+  });
+
+  return el('div', { class: 'panel-inner' }, [
+    taskBlock,
+    classBlock,
+    methodBlock,
     settingsBlock,
     tidyBlock(app, boxCount),
   ]);

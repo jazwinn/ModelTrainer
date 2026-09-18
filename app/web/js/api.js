@@ -42,6 +42,7 @@ export const api = {
   propagate:    (payload)     => request('POST', '/api/autolabel/propagate', payload),
   track:        (payload)     => request('POST', '/api/autolabel/track', payload),
   prompt:       (payload)     => request('POST', '/api/autolabel/prompt', payload),
+  snap:         (payload)     => request('POST', '/api/autolabel/snap', payload),
 
   jobs:         ()            => request('GET', '/api/jobs'),
   jobLog:       (id)          => request('GET', `/api/jobs/${id}/log`),
