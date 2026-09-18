@@ -17,6 +17,7 @@ env/
 *.swo
 
 # Application Data / Outputs
+/.modeltrainer/
 /runs/
 /datasets/
 /exported_datasets/

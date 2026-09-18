@@ -1,5 +1,5 @@
 """
-SAM 3 / SAM 3.1 inference handler — Promptable Concept Segmentation (PCS).
+SAM 3 / SAM 3.1 inference — Promptable Concept Segmentation (PCS).
 
 Unlike SAM 2 (point-grid mask generation), SAM 3 segments by *concept*:
   - a TEXT phrase  (e.g. "car", "yellow school bus")  → segments ALL matches
@@ -11,18 +11,17 @@ transformers integration loads through `facebook/sam3` (Sam3Model / Sam3Processo
 The `facebook/sam3.1` repo ships improved checkpoints but no transformers config,
 so we load via `facebook/sam3` and fall back gracefully.
 
-Prompt label conventions (SAM 3):
-  1  = positive (include)
-  0  = negative (exclude)
+Everything here is Qt-free: long operations take callbacks for progress and a
+`should_abort` predicate so the caller can stop them at any time.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Callable
 
 import numpy as np
 from PIL import Image
-from qtpy.QtCore import QThread, Signal
 
 
 # ---------------------------------------------------------------------------
@@ -38,21 +37,28 @@ class BBox:
     class_id: int = 0
     source: str = "sam"  # "sam" | "manual" | "dataset"
     polygon: list[float] | None = None   # flat [x1,y1,...] normalized 0–1 for seg labels
-    keypoints: list[tuple[float, float] | None] | None = None  # normalized (x,y); None entry = removed corner
+    keypoints: list[tuple[float, float] | None] | None = None  # normalized (x,y); None = removed corner
+    score: float | None = None           # SAM confidence, when known
 
     def to_dict(self) -> dict:
         return {"x1": self.x1, "y1": self.y1, "x2": self.x2, "y2": self.y2,
                 "class_id": self.class_id, "source": self.source,
-                "polygon": self.polygon, "keypoints": self.keypoints}
+                "polygon": self.polygon,
+                "keypoints": [list(k) if k is not None else None for k in self.keypoints]
+                if self.keypoints is not None else None,
+                "score": self.score}
 
     @staticmethod
     def from_dict(d: dict) -> "BBox":
         kpts = d.get("keypoints")
         if kpts is not None:
             kpts = [tuple(k) if k is not None else None for k in kpts]
-        return BBox(x1=d["x1"], y1=d["y1"], x2=d["x2"], y2=d["y2"],
-                    class_id=d.get("class_id", 0), source=d.get("source", "sam"),
-                    polygon=d.get("polygon"), keypoints=kpts)
+        return BBox(x1=float(d["x1"]), y1=float(d["y1"]),
+                    x2=float(d["x2"]), y2=float(d["y2"]),
+                    class_id=int(d.get("class_id", 0)),
+                    source=d.get("source", "sam"),
+                    polygon=d.get("polygon"), keypoints=kpts,
+                    score=d.get("score"))
 
 
 @dataclass
@@ -62,6 +68,34 @@ class FrameAnnotation:
     boxes: list[BBox] = field(default_factory=list)
     status: str = "pending"   # "pending" | "verified" | "exported"
     source_video: str = ""    # absolute path of the source video (empty for still images)
+    source_image: str = ""    # absolute path of the source image (empty for video frames)
+    width: int = 0
+    height: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "frame_index": self.frame_index,
+            "image_path": self.image_path,
+            "boxes": [b.to_dict() for b in self.boxes],
+            "status": self.status,
+            "source_video": self.source_video,
+            "source_image": self.source_image,
+            "width": self.width,
+            "height": self.height,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "FrameAnnotation":
+        return FrameAnnotation(
+            frame_index=int(d["frame_index"]),
+            image_path=d["image_path"],
+            boxes=[BBox.from_dict(b) for b in d.get("boxes", [])],
+            status=d.get("status", "pending"),
+            source_video=d.get("source_video", ""),
+            source_image=d.get("source_image", ""),
+            width=int(d.get("width", 0)),
+            height=int(d.get("height", 0)),
+        )
 
 
 AnnotationStore = dict[int, FrameAnnotation]
@@ -80,6 +114,11 @@ SAM_MODELS = {
 # checkpoint-only repo.  If a selected id can't be loaded we fall back to this.
 _FALLBACK_MODEL_ID = "facebook/sam3"
 
+# The video tracker is a distinct model (SAM2-style memory tracker) loaded from
+# facebook/sam3 — it propagates the exact objects you box on one frame through
+# the rest of an ordered video by visual memory.
+_TRACKER_MODEL_ID = "facebook/sam3"
+
 
 def _load_sam3(model_id: str, local_only: bool):
     """Load a SAM 3 model + processor, falling back to facebook/sam3."""
@@ -90,9 +129,7 @@ def _load_sam3(model_id: str, local_only: bool):
 
     def _try(mid: str):
         proc = Sam3Processor.from_pretrained(mid, local_files_only=local_only)
-        mdl = Sam3Model.from_pretrained(
-            mid, local_files_only=local_only, torch_dtype=dtype
-        )
+        mdl = Sam3Model.from_pretrained(mid, local_files_only=local_only, torch_dtype=dtype)
         return mdl, proc
 
     try:
@@ -101,6 +138,42 @@ def _load_sam3(model_id: str, local_only: bool):
         if model_id != _FALLBACK_MODEL_ID:
             return _try(_FALLBACK_MODEL_ID)
         raise
+
+
+def load_sam3(model_key: str):
+    """Load (and move to the best device) the SAM 3 concept model."""
+    import torch
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model_id = SAM_MODELS.get(model_key, _FALLBACK_MODEL_ID)
+    try:
+        model, processor = _load_sam3(model_id, local_only=True)
+    except Exception:
+        model, processor = _load_sam3(model_id, local_only=False)
+    return model.to(device).eval(), processor
+
+
+def load_sam3_tracker():
+    """Load the SAM 3 video memory tracker."""
+    import torch
+    from transformers import Sam3TrackerVideoModel, Sam3TrackerVideoProcessor
+
+    def _try(local_only: bool):
+        processor = Sam3TrackerVideoProcessor.from_pretrained(
+            _TRACKER_MODEL_ID, local_files_only=local_only
+        )
+        model = Sam3TrackerVideoModel.from_pretrained(
+            _TRACKER_MODEL_ID, local_files_only=local_only
+        )
+        return model, processor
+
+    try:
+        model, processor = _try(True)
+    except Exception:
+        model, processor = _try(False)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    return model.to(device).eval(), processor
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +200,19 @@ def _mask_to_bbox(mask) -> tuple[int, int, int, int] | None:
     return int(xs[0]), int(ys[0]), int(xs[-1]), int(ys[-1])
 
 
-def _run_sam3(
+def _to_device(inputs, model):
+    device = _model_device(model)
+    model_dtype = next(model.parameters()).dtype
+    return {
+        k: (v.to(device, dtype=model_dtype)
+            if hasattr(v, "to") and getattr(v, "dtype", None) is not None
+            and getattr(v.dtype, "is_floating_point", False)
+            else v.to(device) if hasattr(v, "to") else v)
+        for k, v in inputs.items()
+    }
+
+
+def run_sam3(
     model,
     processor,
     pil_img: Image.Image,
@@ -146,7 +231,6 @@ def _run_sam3(
     """
     import torch
 
-    device = _model_device(model)
     W, H = pil_img.size
 
     proc_kwargs: dict = dict(images=pil_img, return_tensors="pt")
@@ -168,14 +252,7 @@ def _run_sam3(
     if not text and not any(lbl == 1 for lbl in labels):
         return []  # nothing to segment
 
-    inputs = processor(**proc_kwargs)
-    # Move to device; only convert float tensors to model's dtype (keep integers as-is)
-    model_dtype = next(model.parameters()).dtype
-    inputs = {
-        k: (v.to(device, dtype=model_dtype) if hasattr(v, "to") and v.dtype.is_floating_point else
-            v.to(device) if hasattr(v, "to") else v)
-        for k, v in inputs.items()
-    }
+    inputs = _to_device(processor(**proc_kwargs), model)
 
     with torch.inference_mode():
         outputs = model(**inputs)
@@ -187,76 +264,20 @@ def _run_sam3(
         target_sizes = [[H, W]]
 
     results = processor.post_process_instance_segmentation(
-        outputs,
-        threshold=threshold,
-        mask_threshold=0.5,
-        target_sizes=target_sizes,
+        outputs, threshold=threshold, mask_threshold=0.5, target_sizes=target_sizes,
     )[0]
 
-    out: list[BBox] = []
+    return _results_to_boxes(results, W, H, class_id)
+
+
+def _results_to_boxes(results, W: int, H: int, class_id: int) -> list[BBox]:
     boxes = results.get("boxes")
     if boxes is None:
-        return out
-    for box in boxes:
-        coords = box.tolist() if hasattr(box, "tolist") else list(box)
-        x1, y1, x2, y2 = (float(coords[0]), float(coords[1]),
-                          float(coords[2]), float(coords[3]))
-        # clamp to image bounds
-        x1 = max(0.0, min(W, x1)); x2 = max(0.0, min(W, x2))
-        y1 = max(0.0, min(H, y1)); y2 = max(0.0, min(H, y2))
-        if x2 - x1 < 1 or y2 - y1 < 1:
-            continue
-        out.append(BBox(x1=x1, y1=y1, x2=x2, y2=y2, class_id=class_id, source="sam"))
-    return out
-
-
-def _run_sam3_batch_text(
-    model,
-    processor,
-    pil_img: Image.Image,
-    texts: list[str],
-    class_ids: list[int],
-    threshold: float = 0.5,
-) -> list[BBox]:
-    """Batch process multiple text concepts for a single image."""
-    import torch
-
-    device = _model_device(model)
-    W, H = pil_img.size
-
-    # SAM 3 processor accepts a list of lists of strings for batched text
-    inputs = processor(images=pil_img, text=[texts], return_tensors="pt")
-    # Move to device; only convert float tensors to model's dtype (keep integers as-is)
-    model_dtype = next(model.parameters()).dtype
-    inputs = {
-        k: (v.to(device, dtype=model_dtype) if hasattr(v, "to") and v.dtype.is_floating_point else
-            v.to(device) if hasattr(v, "to") else v)
-        for k, v in inputs.items()
-    }
-
-    with torch.inference_mode():
-        outputs = model(**inputs)
-
-    target_sizes = [[H, W]]
-    results = processor.post_process_instance_segmentation(
-        outputs,
-        threshold=threshold,
-        mask_threshold=0.5,
-        target_sizes=target_sizes,
-    )[0]
+        return []
+    scores = results.get("scores")
 
     out: list[BBox] = []
-    boxes = results.get("boxes")
-    labels = results.get("labels") # corresponds to indices of the text array
-    if boxes is None or labels is None:
-        return out
-
     for i, box in enumerate(boxes):
-        label_idx = int(labels[i])
-        if label_idx < 0 or label_idx >= len(class_ids):
-            continue
-        cid = class_ids[label_idx]
-        
         coords = box.tolist() if hasattr(box, "tolist") else list(box)
         x1, y1, x2, y2 = (float(coords[0]), float(coords[1]),
                           float(coords[2]), float(coords[3]))
@@ -264,308 +285,175 @@ def _run_sam3_batch_text(
         y1 = max(0.0, min(H, y1)); y2 = max(0.0, min(H, y2))
         if x2 - x1 < 1 or y2 - y1 < 1:
             continue
-        out.append(BBox(x1=x1, y1=y1, x2=x2, y2=y2, class_id=cid, source="sam"))
+        score = None
+        if scores is not None:
+            try:
+                score = round(float(scores[i]), 4)
+            except Exception:
+                score = None
+        out.append(BBox(x1=x1, y1=y1, x2=x2, y2=y2, class_id=class_id,
+                        source="sam", score=score))
     return out
 
 
-
 # ---------------------------------------------------------------------------
-# Workers
+# Bulk operations (driven by callbacks — no threading here)
 # ---------------------------------------------------------------------------
 
-class SAM3LoadWorker(QThread):
-    """Loads a SAM 3 model once; the (model, processor) are reused by both
-    the text bulk worker and the positive/negative prompt worker."""
-
-    loaded = Signal(object, object)  # model, processor
-    error  = Signal(str)
-
-    def __init__(self, model_key: str, parent=None):
-        super().__init__(parent)
-        self.model_key = model_key
-
-    def run(self) -> None:
-        import torch
-
-        device   = "cuda" if torch.cuda.is_available() else "cpu"
-        model_id = SAM_MODELS.get(self.model_key, _FALLBACK_MODEL_ID)
-        try:
-            model, processor = _load_sam3(model_id, local_only=True)
-        except Exception:
-            try:
-                model, processor = _load_sam3(model_id, local_only=False)
-            except Exception as exc:
-                self.error.emit(f"SAM 3 load failed: {exc}")
-                return
-        model = model.to(device).eval()
-        self.loaded.emit(model, processor)
-
-
-class SAM3TextWorker(QThread):
-    """Bulk auto-label by concept across many frames.
-
-    `concepts` is a list of (text, class_id) pairs.  Every frame is segmented
-    once per concept and the results merged — this is how 'label the first
-    frame, auto-label the rest' works for loose images: the class names you
-    assigned become the concepts SAM 3 looks for everywhere.
+def run_concepts_over_frames(
+    model,
+    processor,
+    frames: list[tuple[int, str]],
+    concepts: list[tuple[str, int]],
+    *,
+    threshold: float = 0.5,
+    on_boxes: Callable[[int, list[BBox]], None],
+    on_progress: Callable[[int, int], None] | None = None,
+    should_abort: Callable[[], bool] | None = None,
+    on_error: Callable[[str], None] | None = None,
+) -> int:
     """
+    Search every frame for each (text, class_id) concept and report the hits.
 
-    boxes_ready = Signal(int, list)  # frame_index, list[BBox]
-    progress    = Signal(int, int)   # done, total
-    finished    = Signal()
-    error       = Signal(str)
+    This is how both "find by description" and "copy this frame's labels
+    everywhere" work: the concepts are either typed by the user or derived
+    from the class names already present on a seed frame.
 
-    def __init__(self, model, processor, frame_paths: list[tuple[int, str]],
-                 concepts: list[tuple[str, int]], threshold: float = 0.5, parent=None):
-        super().__init__(parent)
-        self.model       = model
-        self.processor   = processor
-        self.frame_paths = frame_paths
-        self.concepts    = concepts
-        self.threshold   = threshold
-        self._abort      = False
+    Each concept gets its own forward pass.  Handing the processor several
+    phrases at once does run, but the post-processed result carries no labels
+    tying a box back to the phrase that matched it, so there would be no way to
+    assign class ids — one pass per concept is the only correct option.
+    """
+    total = len(frames)
+    processed = 0
+    wanted = [(text, class_id) for text, class_id in concepts if text]
 
-    def abort(self) -> None:
-        self._abort = True
+    for frame_index, png_path in frames:
+        if should_abort and should_abort():
+            break
+        try:
+            pil_img = Image.open(png_path).convert("RGB")
+            boxes: list[BBox] = []
+            for text, class_id in wanted:
+                if should_abort and should_abort():
+                    break
+                boxes.extend(run_sam3(
+                    model, processor, pil_img,
+                    text=text, class_id=class_id, threshold=threshold,
+                ))
+            on_boxes(frame_index, boxes)
+        except Exception as exc:
+            if on_error:
+                on_error(f"Frame {frame_index}: {exc}")
+        processed += 1
+        if on_progress:
+            on_progress(processed, total)
+    return processed
 
-    def run(self) -> None:
-        total = len(self.frame_paths)
-        for done, (frame_index, png_path) in enumerate(self.frame_paths, start=1):
-            if self._abort:
+
+def track_through_frames(
+    model,
+    processor,
+    frames: list[tuple[int, str]],
+    seed_boxes: list[tuple[tuple[float, float, float, float], int]],
+    start_frame_index: int,
+    *,
+    max_frames: int | None = None,
+    on_boxes: Callable[[int, list[BBox]], None],
+    on_progress: Callable[[int, int], None] | None = None,
+    should_abort: Callable[[], bool] | None = None,
+    on_status: Callable[[str], None] | None = None,
+) -> int:
+    """
+    Follow the exact objects boxed on the seed frame through the ordered
+    frame list using SAM 3's memory tracker.  Each seed box becomes a tracked
+    object carrying its class id.
+    """
+    import torch
+
+    if not frames or not seed_boxes:
+        return 0
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Tracking only ever runs forward from the seed, and the tracker needs every
+    # frame decoded up front — so decode just the window we are going to visit.
+    # On a long video "track 200 frames" then costs 200 images of RAM, not all
+    # 20,000 of them.
+    pos_of = {fi: pos for pos, (fi, _) in enumerate(frames)}
+    start_pos = pos_of.get(start_frame_index, 0)
+    end_pos = len(frames) if not max_frames else min(len(frames), start_pos + max_frames)
+    window = frames[start_pos:end_pos]
+    if not window:
+        return 0
+
+    if on_status:
+        on_status(f"Decoding {len(window)} frames for the tracker…")
+    images = []
+    for _, path in window:
+        if should_abort and should_abort():
+            return 0
+        images.append(Image.open(path).convert("RGB"))
+
+    if on_status:
+        on_status("Starting tracker session…")
+    session = processor.init_video_session(video=images, inference_device=device)
+
+    # Seed every object on the start frame.
+    obj_ids: list[int] = []
+    input_boxes: list[list[float]] = []
+    objid_to_class: dict[int, int] = {}
+    for i, (box, class_id) in enumerate(seed_boxes, start=1):
+        obj_ids.append(i)
+        input_boxes.append([float(box[0]), float(box[1]), float(box[2]), float(box[3])])
+        objid_to_class[i] = class_id
+
+    # The session indexes the window, so the seed frame is position 0 in it.
+    processor.add_inputs_to_inference_session(
+        inference_session=session,
+        frame_idx=0,
+        obj_ids=obj_ids,
+        input_boxes=[input_boxes],
+    )
+
+    total = len(window)
+    done = 0
+
+    with torch.inference_mode():
+        for fpos in range(total):
+            if should_abort and should_abort():
                 break
-            try:
-                pil_img = Image.open(png_path).convert("RGB")
-                boxes: list[BBox] = []
-                for text, class_id in self.concepts:
-                    if not text:
-                        continue
-                    boxes.extend(_run_sam3(
-                        self.model, self.processor, pil_img,
-                        text=text, class_id=class_id, threshold=self.threshold,
-                    ))
-                self.boxes_ready.emit(frame_index, boxes)
-            except Exception as exc:
-                self.error.emit(f"SAM 3 error on frame {frame_index}: {exc}")
-            self.progress.emit(done, total)
-        self.finished.emit()
 
+            out = model(session, frame_idx=fpos)
+            frame_index = window[fpos][0]
+            res = processor.post_process_masks(
+                [out.pred_masks],
+                original_sizes=[[session.video_height, session.video_width]],
+                binarize=True,
+            )[0]
+            scores = getattr(out, "object_score_logits", None)
+            session_obj_ids = list(getattr(session, "obj_ids", []))
 
-class SAM3PromptWorker(QThread):
-    """Interactive positive/negative prompt on a single frame.
+            boxes: list[BBox] = []
+            for i in range(res.shape[0]):
+                if scores is not None:
+                    try:
+                        if float(scores[i]) <= 0:
+                            continue  # object not present in this frame
+                    except Exception:
+                        pass
+                mask = res[i, 0].cpu().numpy().astype(bool)
+                bb = _mask_to_bbox(mask)
+                if bb is None:
+                    continue
+                oid = session_obj_ids[i] if i < len(session_obj_ids) else None
+                x1, y1, x2, y2 = bb
+                boxes.append(BBox(x1=x1, y1=y1, x2=x2, y2=y2,
+                                  class_id=objid_to_class.get(oid, 0), source="sam"))
 
-    Positive exemplar boxes → 'find more like this'.
-    Negative exemplar boxes → 'exclude things like this'.
-    Optionally combined with a text concept.
-    """
+            on_boxes(frame_index, boxes)
+            done += 1
+            if on_progress:
+                on_progress(done, total)
 
-    boxes_ready = Signal(int, list)  # frame_index, list[BBox]
-    error       = Signal(str)
-
-    def __init__(self, model, processor, frame_index: int, pil_img: Image.Image,
-                 text: str | None, pos_boxes, neg_boxes,
-                 class_id: int = 0, threshold: float = 0.5, parent=None):
-        super().__init__(parent)
-        self.model       = model
-        self.processor   = processor
-        self.frame_index = frame_index
-        self.pil_img     = pil_img
-        self.text        = text
-        self.pos_boxes   = pos_boxes
-        self.neg_boxes   = neg_boxes
-        self.class_id    = class_id
-        self.threshold   = threshold
-
-    def run(self) -> None:
-        try:
-            boxes = _run_sam3(
-                self.model, self.processor, self.pil_img,
-                text=self.text, pos_boxes=self.pos_boxes, neg_boxes=self.neg_boxes,
-                class_id=self.class_id, threshold=self.threshold,
-            )
-            self.boxes_ready.emit(self.frame_index, boxes)
-        except Exception as exc:
-            self.error.emit(f"SAM 3 prompt error: {exc}")
-
-
-# The video tracker is a distinct model (SAM2-style memory tracker) loaded from
-# facebook/sam3 — it propagates the exact objects you box on one frame through
-# the rest of an ordered video by visual memory.
-_TRACKER_MODEL_ID = "facebook/sam3"
-
-
-def _load_sam3_tracker(local_only: bool):
-    from transformers import Sam3TrackerVideoModel, Sam3TrackerVideoProcessor
-    processor = Sam3TrackerVideoProcessor.from_pretrained(
-        _TRACKER_MODEL_ID, local_files_only=local_only
-    )
-    model = Sam3TrackerVideoModel.from_pretrained(
-        _TRACKER_MODEL_ID, local_files_only=local_only
-    )
-    return model, processor
-
-
-class SAM3TrackWorker(QThread):
-    """Propagate the boxes drawn on one frame through an ordered video.
-
-    Each seed box becomes a tracked object (with its class_id); SAM 3's memory
-    tracker follows it forward through the remaining frames, emitting a box per
-    frame per still-visible object.
-    """
-
-    boxes_ready = Signal(int, list)    # frame_index, list[BBox]
-    progress    = Signal(int, int)     # done, total
-    finished    = Signal()
-    error       = Signal(str)
-    model_ready = Signal(object, object)  # cache tracker (model, processor)
-
-    def __init__(self, frame_paths: list[tuple[int, str]],
-                 seed_frames: list[tuple[int, list[tuple[tuple[float, float, float, float], int]]]],
-                 start_frame_index: int,
-                 max_frames: int | None = None,
-                 model=None, processor=None, parent=None):
-        super().__init__(parent)
-        self.frame_paths       = frame_paths       # sorted [(frame_index, path)]
-        self.seed_frames       = seed_frames       # [(frame_index, [((x1,y1,x2,y2), class_id)])]
-        self.start_frame_index = start_frame_index
-        self.max_frames        = max_frames        # track at most this many frames forward
-        self.model             = model
-        self.processor         = processor
-        self._abort            = False
-
-    def abort(self) -> None:
-        self._abort = True
-
-    def run(self) -> None:
-        import torch
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model, processor = self.model, self.processor
-
-        if model is None or processor is None:
-            try:
-                model, processor = _load_sam3_tracker(local_only=True)
-            except Exception:
-                try:
-                    model, processor = _load_sam3_tracker(local_only=False)
-                except Exception as exc:
-                    self.error.emit(f"SAM 3 tracker load failed: {exc}")
-                    return
-            model = model.to(device).eval()
-            self.model_ready.emit(model, processor)
-
-        ordered = self.frame_paths
-        if not ordered or not self.seed_frames:
-            self.finished.emit()
-            return
-
-        try:
-            frames = [Image.open(p).convert("RGB") for _, p in ordered]
-        except Exception as exc:
-            self.error.emit(f"Failed to load video frames: {exc}")
-            return
-
-        pos_of = {fi: pos for pos, (fi, _) in enumerate(ordered)}
-        start_pos = pos_of.get(self.start_frame_index, 0)
-
-        try:
-            session = processor.init_video_session(video=frames, inference_device=device)
-        except Exception as exc:
-            self.error.emit(f"Tracker session init failed: {exc}")
-            return
-
-        # Seed objects dynamically as we iterate through frames.
-        objid_to_class: dict[int, int] = {}
-        class_to_objids: dict[int, list[int]] = {}
-        next_obj_id = 1
-        
-        sorted_seed_frames = sorted(self.seed_frames, key=lambda x: x[0])
-        pos_to_boxes = {}
-        for fidx, boxes in sorted_seed_frames:
-            frame_pos = pos_of.get(fidx)
-            if frame_pos is not None:
-                pos_to_boxes[frame_pos] = boxes
-
-        remaining = len(ordered) - start_pos
-        total = min(remaining, self.max_frames) if self.max_frames else remaining
-        end_pos = start_pos + total
-        done = 0
-
-        try:
-            import torch
-            with torch.inference_mode():
-                for fpos in range(start_pos, end_pos):
-                    if self._abort:
-                        break
-                        
-                    # Inject inputs dynamically exactly when they appear
-                    if fpos in pos_to_boxes:
-                        class_to_boxes = {}
-                        for box, class_id in pos_to_boxes[fpos]:
-                            class_to_boxes.setdefault(class_id, []).append(box)
-                            
-                        frame_obj_ids = []
-                        frame_input_boxes = []
-                        for cid, bbox_list in class_to_boxes.items():
-                            existing_obj_ids = class_to_objids.get(cid, [])
-                            while len(existing_obj_ids) < len(bbox_list):
-                                new_id = next_obj_id
-                                next_obj_id += 1
-                                existing_obj_ids.append(new_id)
-                                objid_to_class[new_id] = cid
-                            class_to_objids[cid] = existing_obj_ids
-                            
-                            for obj_id, box in zip(existing_obj_ids, bbox_list):
-                                frame_obj_ids.append(obj_id)
-                                frame_input_boxes.append([float(box[0]), float(box[1]), float(box[2]), float(box[3])])
-                                
-                        if frame_obj_ids:
-                            try:
-                                processor.add_inputs_to_inference_session(
-                                    inference_session=session,
-                                    frame_idx=fpos,
-                                    obj_ids=frame_obj_ids,
-                                    input_boxes=[frame_input_boxes],
-                                )
-                            except Exception as exc:
-                                self.error.emit(f"Failed to seed objects at frame {ordered[fpos][0]}: {exc}")
-                                return
-                                
-                    if not class_to_objids:
-                        continue
-
-                    out = model(session, frame_idx=fpos)
-                    
-                    frame_index = ordered[fpos][0]
-                    res = processor.post_process_masks(
-                        [out.pred_masks],
-                        original_sizes=[[session.video_height, session.video_width]],
-                        binarize=True,
-                    )[0]
-                    scores = getattr(out, "object_score_logits", None)
-                    obj_ids = list(getattr(session, "obj_ids", []))
-
-                    boxes: list[BBox] = []
-                    for i in range(res.shape[0]):
-                        if scores is not None:
-                            try:
-                                if float(scores[i]) <= 0:
-                                    continue  # object not present in this frame
-                            except Exception:
-                                pass
-                        mask = res[i, 0].cpu().numpy().astype(bool)
-                        bb = _mask_to_bbox(mask)
-                        if bb is None:
-                            continue
-                        oid = obj_ids[i] if i < len(obj_ids) else None
-                        class_id = objid_to_class.get(oid, 0)
-                        x1, y1, x2, y2 = bb
-                        boxes.append(BBox(x1=x1, y1=y1, x2=x2, y2=y2,
-                                          class_id=class_id, source="sam"))
-
-                    self.boxes_ready.emit(frame_index, boxes)
-                    done += 1
-                    self.progress.emit(done, total)
-        except Exception as exc:
-            self.error.emit(f"Tracking failed: {exc}")
-
-        self.finished.emit()
+    return done

@@ -13,9 +13,10 @@ Fine-tuning strategy
 * Loss: focal + dice (the same combination used in SAM 2's original
   training, weighted equally at 1:1).
 
-The worker emits the same signal shape as YOLOTrainWorker so the existing
-progress-bar / status-label wiring in main_window.py works unchanged; the
-third value carries average loss per epoch instead of mAP50.
+train_sam2() reports progress through the same (epoch, total, value)
+callback shape as train_yolo(), except the value carries average loss per
+epoch instead of mAP50.  It polls should_stop between samples, so Stop takes
+effect immediately rather than at the end of an epoch.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ import random
 
 import numpy as np
 from PIL import Image
-from qtpy.QtCore import QThread, Signal
+from typing import Callable
 
 from app.core.sam3_handler import AnnotationStore
 
@@ -222,211 +223,176 @@ def _collect_samples_from_store(
 # Worker
 # ---------------------------------------------------------------------------
 
-class SAM2TrainWorker(QThread):
-    """Fine-tune a SAM 2 model on an exported YOLO dataset folder.
 
-    Pass *dataset_dir* to read images + label files from disk (the standard
-    path when training from an exported dataset).  Pass *store* as a fallback
-    to train directly from the in-memory annotation store.
+def train_sam2(
+    model_key: str,
+    *,
+    dataset_dir: str | None = None,
+    store: AnnotationStore | None = None,
+    epochs: int = 10,
+    lr: float = 1e-5,
+    output_dir: str = "runs/sam2_finetune",
+    on_epoch: Callable[[int, int, float], None] | None = None,
+    on_log: Callable[[str], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> dict:
+    """Fine-tune a SAM 2 checkpoint on an exported dataset or the live store.
 
-    Signals
-    -------
-    epoch_done(epoch, total_epochs, avg_loss)
-        Emitted after each epoch.  avg_loss replaces the mAP50 value used
-        by YOLO workers so the same progress-bar wiring can be reused.
-    finished(save_dir)
-        Emitted on success with the directory where the model was saved.
-    error(message)
-        Emitted on any fatal error.
+    Returns {"save_dir": <folder containing the fine-tuned model>}.
     """
+    if model_key not in SAM2_MODELS:
+        raise ValueError(f"Unknown SAM 2 model key: {model_key!r}")
+    if dataset_dir is None and store is None:
+        raise ValueError("Provide either dataset_dir or store.")
+    model_id = SAM2_MODELS[model_key]
 
-    epoch_done = Signal(int, int, float)   # epoch, total_epochs, avg_loss
-    finished   = Signal(str)               # checkpoint save directory
-    error      = Signal(str)
+    import torch
+    import torch.nn.functional as F
+    from torch.optim import AdamW
+    from transformers import AutoModel, AutoProcessor
 
-    def __init__(
-        self,
-        model_key: str,
-        dataset_dir: str | None = None,
-        store: AnnotationStore | None = None,
-        epochs: int = 10,
-        lr: float = 1e-5,
-        output_dir: str = "runs/sam2_finetune",
-        parent=None,
-    ):
-        super().__init__(parent)
-        if model_key not in SAM2_MODELS:
-            raise ValueError(f"Unknown SAM 2 model key: {model_key!r}")
-        if dataset_dir is None and store is None:
-            raise ValueError("Provide either dataset_dir or store.")
-        self.model_id    = SAM2_MODELS[model_key]
-        self.dataset_dir = dataset_dir
-        self.store       = store
-        self.epochs      = epochs
-        self.lr          = lr
-        self.output_dir  = output_dir
-        self._abort      = False
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    def abort(self) -> None:
-        self._abort = True
+    # ── Load model & processor ────────────────────────────────
+    # All published facebook/sam2* checkpoints have model_type="sam2_video",
+    # not "sam2".  AutoModel reads the config and picks the right class
+    # automatically, avoiding the "loading sam2_video into Sam2Model" crash.
+    try:
+        processor = AutoProcessor.from_pretrained(
+            model_id, local_files_only=True
+        )
+        model = AutoModel.from_pretrained(
+            model_id, local_files_only=True
+        )
+    except Exception:
+        # Not cached — download
+        processor = AutoProcessor.from_pretrained(model_id)
+        model     = AutoModel.from_pretrained(model_id)
 
-    # ------------------------------------------------------------------
-    def run(self) -> None:
-        try:
-            self._train()
-        except Exception as exc:
-            import traceback
-            self.error.emit(f"SAM 2 training failed: {exc}\n{traceback.format_exc()}")
+    model = model.to(device).train()
 
-    # ------------------------------------------------------------------
-    def _train(self) -> None:
-        import torch
-        import torch.nn.functional as F
-        from torch.optim import AdamW
-        from transformers import AutoModel, AutoProcessor
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        # ── Load model & processor ────────────────────────────────
-        # All published facebook/sam2* checkpoints have model_type="sam2_video",
-        # not "sam2".  AutoModel reads the config and picks the right class
-        # automatically, avoiding the "loading sam2_video into Sam2Model" crash.
-        try:
-            processor = AutoProcessor.from_pretrained(
-                self.model_id, local_files_only=True
-            )
-            model = AutoModel.from_pretrained(
-                self.model_id, local_files_only=True
-            )
-        except Exception:
-            # Not cached — download
-            processor = AutoProcessor.from_pretrained(self.model_id)
-            model     = AutoModel.from_pretrained(self.model_id)
-
-        model = model.to(device).train()
-
-        # ── Freeze image encoder ──────────────────────────────────
-        # The Hiera backbone is called 'vision_encoder' in most HF builds;
-        # fall back to 'image_encoder' for older checkpoints.
-        enc = getattr(model, "vision_encoder",
-                      getattr(model, "image_encoder", None))
-        if enc is not None:
-            for p in enc.parameters():
+    # ── Freeze image encoder ──────────────────────────────────
+    # The Hiera backbone is called 'vision_encoder' in most HF builds;
+    # fall back to 'image_encoder' for older checkpoints.
+    enc = getattr(model, "vision_encoder",
+                  getattr(model, "image_encoder", None))
+    if enc is not None:
+        for p in enc.parameters():
+            p.requires_grad = False
+    # Also freeze memory modules (not used for single-image fine-tuning)
+    for attr in ("memory_attention", "memory_encoder"):
+        mod = getattr(model, attr, None)
+        if mod is not None:
+            for p in mod.parameters():
                 p.requires_grad = False
-        # Also freeze memory modules (not used for single-image fine-tuning)
-        for attr in ("memory_attention", "memory_encoder"):
-            mod = getattr(model, attr, None)
-            if mod is not None:
-                for p in mod.parameters():
-                    p.requires_grad = False
 
-        trainable = [p for p in model.parameters() if p.requires_grad]
-        if not trainable:
-            self.error.emit(
-                "SAM 2: no trainable parameters found after freezing the "
-                "image encoder. Check the model architecture."
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    if not trainable:
+        raise RuntimeError("SAM 2: no trainable parameters found after freezing the "
+            "image encoder. Check the model architecture."
+        )
+
+    optimizer = AdamW(trainable, lr=lr, weight_decay=1e-4)
+
+    # ── Build dataset ─────────────────────────────────────────
+    if dataset_dir:
+        samples = _collect_samples_from_dir(dataset_dir)
+        if not samples:
+            raise RuntimeError(f"SAM 2 training: no labelled images found in:\n"
+                f"  {dataset_dir}\n\n"
+                f"Make sure the folder contains images/ and labels/ "
+                f"sub-directories (export your annotations first)."
             )
-            return
+    else:
+        samples = _collect_samples_from_store(store)
+        if not samples:
+            raise RuntimeError("SAM 2 training: no valid annotated frames found in the "
+                "annotation store. Annotate some frames first."
+            )
 
-        optimizer = AdamW(trainable, lr=self.lr, weight_decay=1e-4)
+    os.makedirs(output_dir, exist_ok=True)
+    if on_log:
+        on_log(f"{len(samples)} training sample(s) on {device}")
+    skipped = 0
 
-        # ── Build dataset ─────────────────────────────────────────
-        if self.dataset_dir:
-            samples = _collect_samples_from_dir(self.dataset_dir)
-            if not samples:
-                self.error.emit(
-                    f"SAM 2 training: no labelled images found in:\n"
-                    f"  {self.dataset_dir}\n\n"
-                    f"Make sure the folder contains images/ and labels/ "
-                    f"sub-directories (export your annotations first)."
-                )
-                return
-        else:
-            samples = _collect_samples_from_store(self.store)
-            if not samples:
-                self.error.emit(
-                    "SAM 2 training: no valid annotated frames found in the "
-                    "annotation store. Annotate some frames first."
-                )
-                return
+    # ── Training loop ─────────────────────────────────────────
+    for epoch in range(1, epochs + 1):
+        if should_stop and should_stop():
+            break
 
-        os.makedirs(self.output_dir, exist_ok=True)
+        random.shuffle(samples)
+        epoch_loss = 0.0
 
-        # ── Training loop ─────────────────────────────────────────
-        for epoch in range(1, self.epochs + 1):
-            if self._abort:
+        for pil_img, box, gt_mask_np in samples:
+            if should_stop and should_stop():
                 break
 
-            random.shuffle(samples)
-            epoch_loss = 0.0
+            try:
+                # Process image + box prompt.
+                # Sam2Processor expects input_boxes as
+                # [[[x1, y1, x2, y2]]] — batch × images × boxes × coords
+                inputs = processor(
+                    images=pil_img,
+                    input_boxes=[[[box]]],
+                    return_tensors="pt",
+                )
+                inputs = {k: v.to(device) for k, v in inputs.items()}
 
-            for pil_img, box, gt_mask_np in samples:
-                if self._abort:
-                    break
+                # Ground-truth mask: (1, H, W)
+                gt = torch.from_numpy(gt_mask_np).unsqueeze(0).to(device)
 
+                # Forward pass (single mask output for clean gradient)
+                outputs = model(**inputs, multimask_output=False)
+
+                # pred_masks shape varies: (B, num_obj, num_masks, H, W)
+                # or (B, num_masks, H, W) — normalise to (N, H, W)
+                pred = outputs.pred_masks
+                while pred.dim() > 3:
+                    pred = pred.squeeze(0)   # remove batch + object dims
+                # pred is now (num_masks, H, W); take the first (only) mask
+                pred = pred[0:1]             # (1, H, W)
+
+                # Resize GT to match predicted spatial dimensions
+                pred_h, pred_w = pred.shape[-2], pred.shape[-1]
+                gt_r = F.interpolate(
+                    gt.unsqueeze(0),
+                    size=(pred_h, pred_w),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)  # (1, H, W)
+
+                loss = _focal_dice_loss(pred, gt_r)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                epoch_loss += loss.item()
+
+            except Exception as sample_exc:
+                # Skip bad samples; do not abort the whole epoch
+                skipped += 1
+                if on_log:
+                    on_log(f"skipped a sample — {sample_exc}")
+
+            finally:
+                # Release GPU memory between samples to avoid OOM
                 try:
-                    # Process image + box prompt.
-                    # Sam2Processor expects input_boxes as
-                    # [[[x1, y1, x2, y2]]] — batch × images × boxes × coords
-                    inputs = processor(
-                        images=pil_img,
-                        input_boxes=[[[box]]],
-                        return_tensors="pt",
-                    )
-                    inputs = {k: v.to(device) for k, v in inputs.items()}
+                    del inputs, outputs, pred, gt, gt_r, loss
+                except Exception:
+                    pass
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-                    # Ground-truth mask: (1, H, W)
-                    gt = torch.from_numpy(gt_mask_np).unsqueeze(0).to(device)
+        avg_loss = epoch_loss / max(len(samples), 1)
+        if on_epoch:
+            on_epoch(epoch, epochs, avg_loss)
+        if on_log:
+            on_log(f"epoch {epoch}/{epochs}  loss={avg_loss:.4f}")
 
-                    # Forward pass (single mask output for clean gradient)
-                    outputs = model(**inputs, multimask_output=False)
-
-                    # pred_masks shape varies: (B, num_obj, num_masks, H, W)
-                    # or (B, num_masks, H, W) — normalise to (N, H, W)
-                    pred = outputs.pred_masks
-                    while pred.dim() > 3:
-                        pred = pred.squeeze(0)   # remove batch + object dims
-                    # pred is now (num_masks, H, W); take the first (only) mask
-                    pred = pred[0:1]             # (1, H, W)
-
-                    # Resize GT to match predicted spatial dimensions
-                    pred_h, pred_w = pred.shape[-2], pred.shape[-1]
-                    gt_r = F.interpolate(
-                        gt.unsqueeze(0),
-                        size=(pred_h, pred_w),
-                        mode="bilinear",
-                        align_corners=False,
-                    ).squeeze(0)  # (1, H, W)
-
-                    loss = _focal_dice_loss(pred, gt_r)
-
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-
-                    epoch_loss += loss.item()
-
-                except Exception as sample_exc:
-                    # Skip bad samples; don't abort the whole epoch
-                    self.error.emit(
-                        f"SAM 2: skipping sample — {sample_exc}"
-                    )
-
-                finally:
-                    # Release GPU memory between samples to avoid OOM
-                    try:
-                        del inputs, outputs, pred, gt, gt_r, loss
-                    except Exception:
-                        pass
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-
-            avg_loss = epoch_loss / max(len(samples), 1)
-            self.epoch_done.emit(epoch, self.epochs, avg_loss)
-
-        # ── Save checkpoint ───────────────────────────────────────
-        save_dir = os.path.join(self.output_dir, "finetuned_sam2")
-        os.makedirs(save_dir, exist_ok=True)
-        model.save_pretrained(save_dir)
-        processor.save_pretrained(save_dir)
-        self.finished.emit(save_dir)
+    # ── Save checkpoint ───────────────────────────────────────
+    save_dir = os.path.join(output_dir, "finetuned_sam2")
+    os.makedirs(save_dir, exist_ok=True)
+    model.save_pretrained(save_dir)
+    processor.save_pretrained(save_dir)
+    return {"save_dir": save_dir, "samples": len(samples), "skipped": skipped}

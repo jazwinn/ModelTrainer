@@ -16,7 +16,7 @@ import shutil
 import cv2
 import yaml
 
-from app.core.sam3_handler import AnnotationStore, BBox, FrameAnnotation
+from app.core.sam3_handler import AnnotationStore, BBox
 
 
 # ---------------------------------------------------------------------------

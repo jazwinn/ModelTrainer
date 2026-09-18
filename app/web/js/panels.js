@@ -1,0 +1,653 @@
+// The three step panels. Everything the old Qt side panel did, reorganised so
+// each auto-label method states plainly what it does and when to use it.
+
+import { api } from './api.js';
+import { classColor } from './canvas.js';
+import { confirmDialog, el, openModal, closeModal, nativePicker, pickPath, plural, toast } from './ui.js';
+
+// ── small builders ─────────────────────────────────────────────
+
+function append(parent, children) {
+  for (const child of children) if (child) parent.appendChild(child);
+}
+
+function field(label, input, hint) {
+  return el('label', { class: 'field' }, [
+    el('span', { text: label }),
+    input,
+    hint ? el('span', { class: 'block-note', text: hint }) : null,
+  ]);
+}
+
+function num(value, { min = 0, max = 999999, step = 1, id = null } = {}) {
+  return el('input', { type: 'number', value: String(value), min, max, step, id });
+}
+
+function select(options, value, id) {
+  const node = el('select', { id });
+  for (const opt of options) {
+    const [val, label] = Array.isArray(opt) ? opt : [opt, opt];
+    node.appendChild(el('option', { value: val, text: label, selected: val === value ? 'selected' : null }));
+  }
+  node.value = value;
+  return node;
+}
+
+function pathField(state, key, { placeholder, onPick }) {
+  const label = el('button', {
+    class: `picker-path ${state[key] ? 'set' : ''}`,
+    title: state[key] || placeholder,
+    text: state[key] || placeholder,
+    onclick: onPick,
+  });
+  return el('div', { class: 'picker-row' }, [label, el('button', { class: 'ghost', text: 'Browse', onclick: onPick })]);
+}
+
+// ── 1 · Media ──────────────────────────────────────────────────
+
+export function mediaPanel(app) {
+  const stride = num(app.ui.importStride, { min: 1, max: 120 });
+  stride.addEventListener('change', () => { app.ui.importStride = Math.max(1, +stride.value || 1); });
+
+  const startImport = async (mode) => {
+    const path = await pickPath({
+      title: mode === 'dataset' ? 'Open a YOLO dataset' : 'Choose a media folder',
+      subtitle: mode === 'dataset'
+        ? 'Pick the folder holding images/, labels/ and data.yaml.'
+        : 'Every image and video inside the folder is imported.',
+      want: 'media',
+      confirmLabel: 'Use this folder',
+      describe: mode === 'dataset' ? async (p) => {
+        try {
+          const info = await api.inspect(p);
+          if (!info.isDataset) return 'No labels/ or data.yaml here — images would be imported without labels.';
+          const classes = info.classes?.length ? ` · ${info.classes.length} classes` : '';
+          return `YOLO dataset · task ${info.task || 'detect'}${classes}`;
+        } catch { return null; }
+      } : null,
+    });
+    if (!path) return;
+
+    if (mode === 'dataset') {
+      let info = null;
+      try { info = await api.inspect(path); } catch { /* let the import report it */ }
+      if (info && !info.isDataset) {
+        const ok = await confirmDialog({
+          title: 'That folder has no labels',
+          message: 'There is no labels/ folder or data.yaml here, so only the images can come in. Import them anyway?',
+          confirmLabel: 'Import the images',
+        });
+        if (!ok) return;
+      }
+    }
+
+    if (mode === 'replace' && app.state.frames.length) {
+      const ok = await confirmDialog({
+        title: 'Replace everything?',
+        message: `This clears the ${app.state.frames.length} frames you have loaded, along with their labels, and imports the new folder instead.`,
+        confirmLabel: 'Replace',
+        danger: true,
+      });
+      if (!ok) return;
+    }
+
+    try {
+      await api.import({ path, mode, stride: Math.max(1, +stride.value || 1) });
+      app.goStep('label');
+    } catch (err) {
+      toast(err.message, 'error', 'Import failed');
+    }
+  };
+
+  const stats = app.state.stats || {};
+
+  return el('div', { class: 'panel-inner' }, [
+    el('div', { class: 'block' }, [
+      el('h3', {}, ['Bring in your media']),
+      el('p', { class: 'block-note', text: 'Images are kept as they are. Videos are split into frames.' }),
+      el('button', { class: 'btn primary block-btn', text: 'Import images or video', onclick: () => startImport('replace') }),
+      el('button', { class: 'btn block-btn', text: 'Add more to what is loaded', onclick: () => startImport('add') }),
+      el('button', { class: 'btn block-btn', text: 'Open an existing YOLO dataset', onclick: () => startImport('dataset') }),
+      el('p', { class: 'block-note', text: 'Opening a dataset also loads its class names and existing boxes.' }),
+    ]),
+
+    el('hr', { class: 'rule' }),
+
+    el('div', { class: 'block' }, [
+      el('h3', {}, ['Video frames', el('small', { text: 'sampling' })]),
+      field('Keep 1 frame in every', stride,
+        'A 30 fps clip at 5 gives you 6 frames per second — plenty for labelling, and far fewer files. Tracking needs 1.'),
+    ]),
+
+    el('hr', { class: 'rule' }),
+
+    nativePicker.available ? el('div', { class: 'block' }, [
+      el('h3', {}, ['Choosing folders']),
+      (() => {
+        const box = el('input', { type: 'checkbox', ...(app.ui.nativeDialogs !== false ? { checked: 'checked' } : {}) });
+        box.addEventListener('change', () => {
+          app.ui.nativeDialogs = box.checked;
+          nativePicker.enabled = box.checked;
+          app.renderPanel();
+        });
+        return el('label', { class: 'inline-field' }, [box, 'Use the Windows file dialog']);
+      })(),
+      el('p', { class: 'block-note', text: app.ui.nativeDialogs !== false
+        ? 'Browse buttons open Explorer, the same dialog every other Windows app uses.'
+        : 'Browse buttons open the folder browser built into this page.' }),
+    ]) : null,
+    nativePicker.available ? el('hr', { class: 'rule' }) : null,
+
+    el('div', { class: 'block' }, [
+      el('h3', {}, ['This session']),
+      el('div', { class: 'stats' }, [
+        el('div', { class: 'stat' }, [el('b', { text: String(stats.frames ?? 0) }), el('span', { text: 'frames' })]),
+        el('div', { class: 'stat' }, [el('b', { text: String(stats.labelled ?? 0) }), el('span', { text: 'labelled' })]),
+        el('div', { class: 'stat' }, [el('b', { text: String(stats.boxes ?? 0) }), el('span', { text: 'objects' })]),
+      ]),
+      el('p', { class: 'block-note', text: 'Your work saves itself and comes back when you reopen ModelTrainer.' }),
+      el('button', {
+        class: 'btn danger block-btn',
+        text: 'Clear this session',
+        onclick: async () => {
+          const ok = await confirmDialog({
+            title: 'Clear everything?',
+            message: 'Every frame and label in this session is removed. Exported datasets on disk are untouched.',
+            confirmLabel: 'Clear session',
+            danger: true,
+          });
+          if (ok) { await api.resetSession(); toast('Session cleared.', 'ok'); }
+        },
+      }),
+    ]),
+  ]);
+}
+
+// ── 2 · Label ──────────────────────────────────────────────────
+
+const METHODS = [
+  {
+    id: 'describe',
+    title: 'Describe what to find',
+    sub: 'Type what the object is. SAM 3 finds every match, frame by frame.',
+    when: 'Best when you can name the thing: "car", "solar panel", "yellow helmet".',
+  },
+  {
+    id: 'example',
+    title: 'Point at an example',
+    sub: 'Box one object on this frame; SAM 3 finds the others like it here.',
+    when: 'Best when the object is hard to name, or a description brings back the wrong things.',
+  },
+  {
+    id: 'reuse',
+    title: 'Reuse this frame’s labels',
+    sub: 'Takes the classes you used here and searches for them in the other frames.',
+    when: 'Best for photo sets and changing scenes, where each frame stands on its own.',
+  },
+  {
+    id: 'track',
+    title: 'Track through the video',
+    sub: 'Follows the exact objects you boxed here into the frames that come after.',
+    when: 'Best for continuous video of the same moving objects. Needs frames imported at stride 1.',
+  },
+];
+
+export function labelPanel(app) {
+  const frame = app.currentFrame();
+  const detail = app.frameDetail;
+  const boxCount = detail?.boxes?.length ?? 0;
+
+  // ── Classes ──
+  const classTags = el('div', { class: 'classlist' },
+    app.state.classes.map((name, i) => el('span', { class: 'classtag' }, [
+      el('i', { style: `background:${classColor(i)}` }),
+      el('span', { text: name }),
+    ])));
+
+  const classBlock = el('div', { class: 'block' }, [
+    el('h3', {}, ['Classes', el('small', { text: `${app.state.classes.length} defined` })]),
+    classTags,
+    el('button', { class: 'btn block-btn', text: 'Edit classes', onclick: () => editClasses(app) }),
+  ]);
+
+  // ── Shared auto-label settings ──
+  const samModel = select(app.state.samModels, app.state.samModel);
+  samModel.addEventListener('change', () => api.settings({ samModel: samModel.value }));
+
+  const threshold = el('input', {
+    type: 'range', min: '0.05', max: '0.95', step: '0.05', value: String(app.state.threshold),
+  });
+  const thresholdOut = el('span', { class: 'block-note', text: confidenceLabel(app.state.threshold) });
+  threshold.addEventListener('input', () => { thresholdOut.textContent = confidenceLabel(+threshold.value); });
+  threshold.addEventListener('change', () => api.settings({ threshold: +threshold.value }));
+
+  const policy = select([
+    ['replace', 'Replace them'],
+    ['merge', 'Keep them and add'],
+    ['skip', 'Leave that frame alone'],
+  ], app.ui.policy);
+  policy.addEventListener('change', () => { app.ui.policy = policy.value; app.renderPanel(); });
+
+  const settingsBlock = el('div', { class: 'block' }, [
+    el('h3', {}, ['Auto-label settings']),
+    field('Model', samModel),
+    field('Confidence', threshold, null),
+    thresholdOut,
+    field('If a frame already has labels', policy,
+      app.ui.policy === 'replace'
+        ? 'Careful: boxes you drew by hand on those frames are overwritten.'
+        : app.ui.policy === 'skip'
+          ? 'Frames you have already labelled are skipped entirely.'
+          : 'New findings are added next to what is already there.'),
+  ]);
+
+  // ── Methods ──
+  const methods = el('div', { class: 'methods' },
+    METHODS.map((method) => methodCard(app, method, { frame, detail, boxCount })));
+
+  return el('div', { class: 'panel-inner' }, [
+    classBlock,
+    el('hr', { class: 'rule' }),
+    el('div', { class: 'block' }, [
+      el('h3', {}, ['Label automatically']),
+      el('p', { class: 'block-note', text: 'Pick one way to work. Each one runs on its own and can be stopped at any time.' }),
+      methods,
+    ]),
+    el('hr', { class: 'rule' }),
+    settingsBlock,
+  ]);
+}
+
+function confidenceLabel(value) {
+  const pct = Math.round(value * 100);
+  if (value <= 0.3) return `${pct}% — more objects found, more mistakes`;
+  if (value >= 0.7) return `${pct}% — only confident matches`;
+  return `${pct}% — balanced`;
+}
+
+function methodCard(app, method, ctx) {
+  const open = app.ui.method === method.id;
+  const head = el('button', { class: 'method-head', onclick: () => { app.ui.method = method.id; app.onMethodChange(); } }, [
+    el('span', { class: 'method-dot' }),
+    el('span', {}, [
+      el('div', { class: 'method-title', text: method.title }),
+      el('div', { class: 'method-sub', text: method.sub }),
+    ]),
+  ]);
+
+  const card = el('div', { class: 'method', 'data-open': open ? 'true' : 'false' }, [head]);
+  if (open) card.appendChild(methodBody(app, method, ctx));
+  return card;
+}
+
+function methodBody(app, method, { frame, detail, boxCount }) {
+  const body = el('div', { class: 'method-body' }, [el('p', { class: 'method-when', text: method.when })]);
+  const ui = app.ui;
+
+  if (method.id === 'describe') {
+    const concept = el('input', { type: 'text', placeholder: 'e.g. solar panel', value: ui.concept || '' });
+    concept.addEventListener('input', () => { ui.concept = concept.value; });
+    const cls = select(app.state.classes.map((n, i) => [String(i), n]), String(ui.classId));
+    cls.addEventListener('change', () => app.setSearchClass(+cls.value));
+    const start = num(ui.start, { min: 0 });
+    const every = num(ui.stride, { min: 1, max: 120 });
+    const count = () => countFrames(app, +start.value, +every.value);
+
+    const run = el('button', { class: 'btn primary block-btn', text: `Search ${count()} frames` });
+    const refresh = () => { run.textContent = `Search ${count()} frames`; };
+    start.addEventListener('input', refresh);
+    every.addEventListener('input', refresh);
+
+    run.onclick = async () => {
+      ui.start = +start.value; ui.stride = +every.value;
+      try {
+        await api.describe({
+          concept: concept.value.trim(),
+          classId: +cls.value,
+          start: +start.value,
+          stride: +every.value,
+          policy: ui.policy,
+        });
+      } catch (err) { toast(err.message, 'error', 'Could not start'); }
+    };
+
+    body.append(
+      field('What to find', concept, 'Leave blank to search for the class name.'),
+      field('Save matches as', cls),
+      el('div', { class: 'field-row' }, [
+        field('Start at frame', start),
+        field('Every Nth frame', every),
+      ]),
+      run,
+    );
+  }
+
+  if (method.id === 'example') {
+    const tally = el('div', { class: 'tally' }, [
+      el('span', { class: 'pos' }, [el('b', { text: String(app.examples.positive.length) }), ' to find']),
+      el('span', { class: 'neg' }, [el('b', { text: String(app.examples.negative.length) }), ' to exclude']),
+    ]);
+
+    const text = el('input', { type: 'text', placeholder: 'optional: also describe it', value: ui.promptText || '' });
+    text.addEventListener('input', () => { ui.promptText = text.value; });
+
+    const run = el('button', {
+      class: 'btn primary block-btn',
+      text: 'Find matches on this frame',
+      disabled: (!app.examples.positive.length && !(ui.promptText || '').trim()) || !frame ? 'disabled' : null,
+    });
+    run.onclick = async () => {
+      try {
+        await api.prompt({
+          frame: app.currentIndex,
+          positive: app.examples.positive,
+          negative: app.examples.negative,
+          text: text.value.trim(),
+          classId: ui.classId,
+          policy: 'merge',
+        });
+      } catch (err) { toast(err.message, 'error', 'Could not start'); }
+    };
+
+    body.append(
+      el('ol', { class: 'steplist' }, [
+        el('li', {}, [el('b', { text: 'Example' }), ' in the toolbar, then drag a box around one object you want.']),
+        el('li', {}, [el('b', { text: 'Exclude' }), ' and drag around anything it should not match (optional).']),
+        el('li', {}, ['Run it. Matches land on this frame as ', el('b', { text: 'new boxes' }), '.']),
+      ]),
+      tally,
+      field('Describe it too', text, 'A word or two sharpens the search when examples alone are ambiguous.'),
+      run,
+      el('button', { class: 'btn block-btn', text: 'Clear examples', onclick: () => app.clearExamples() }),
+      el('p', { class: 'block-note', text: 'This works on the frame you are looking at. To spread labels, use one of the other methods afterwards.' }),
+    );
+  }
+
+  if (method.id === 'reuse') {
+    const start = num(ui.start, { min: 0 });
+    const names = detail?.boxes?.length
+      ? [...new Set(detail.boxes.map((b) => app.state.classes[b.class_id] || `class ${b.class_id}`))]
+      : [];
+
+    const run = el('button', {
+      class: 'btn primary block-btn',
+      text: `Copy to ${Math.max(0, countFrames(app, +start.value, 1) - 1)} frames`,
+      disabled: boxCount ? null : 'disabled',
+    });
+    start.addEventListener('input', () => {
+      run.textContent = `Copy to ${Math.max(0, countFrames(app, +start.value, 1) - 1)} frames`;
+    });
+    run.onclick = async () => {
+      ui.start = +start.value;
+      try {
+        await api.propagate({ seed: app.currentIndex, start: +start.value, policy: ui.policy });
+      } catch (err) { toast(err.message, 'error', 'Could not start'); }
+    };
+
+    body.append(
+      boxCount
+        ? el('p', { class: 'block-note' }, [`Searches other frames for: `, el('b', { text: names.join(', ') })])
+        : el('p', { class: 'block-note', text: 'Label this frame first — its classes become the search terms.' }),
+      field('Start at frame', start, 'Useful after adding new media: skip the frames you already did.'),
+      run,
+    );
+  }
+
+  if (method.id === 'track') {
+    const range = num(ui.trackRange, { min: 0, max: 100000 });
+    const isVideo = detail?.isVideo;
+    const stride = detail?.importStride ?? 1;
+
+    const run = el('button', {
+      class: 'btn primary block-btn',
+      text: frame ? `Track forward from frame ${app.currentIndex}` : 'Track forward',
+      disabled: boxCount && isVideo ? null : 'disabled',
+    });
+    run.onclick = async () => {
+      ui.trackRange = +range.value;
+      try {
+        const res = await api.track({ seed: app.currentIndex, range: +range.value, policy: ui.policy });
+        if (res.needsConfirm) {
+          const ok = await confirmDialog({
+            title: 'Frame gaps may break tracking',
+            message: res.reason,
+            confirmLabel: 'Track anyway',
+            danger: true,
+          });
+          if (ok) await api.track({ seed: app.currentIndex, range: +range.value, policy: ui.policy, confirm: true });
+        }
+      } catch (err) { toast(err.message, 'error', 'Could not start'); }
+    };
+
+    // Node.append() stringifies null, so drop the branches that produced none.
+    append(body, [
+      !isVideo
+        ? el('p', { class: 'block-note', text: 'This frame came from a still image, so there is no video to follow. Use “Reuse this frame’s labels” instead.' })
+        : stride > 1
+          ? el('p', { class: 'block-note', text: `This video was imported keeping 1 frame in every ${stride}. The tracker works best at stride 1.` })
+          : null,
+      !boxCount ? el('p', { class: 'block-note', text: 'Draw a box around each object you want followed, then run this.' }) : null,
+      field('How many frames forward', range, '0 follows the objects to the end of the video.'),
+      run,
+    ]);
+  }
+
+  return body;
+}
+
+function countFrames(app, start, stride) {
+  const step = Math.max(1, stride || 1);
+  return app.state.frames.filter((f) => f.index >= (start || 0) && f.index % step === 0).length;
+}
+
+function editClasses(app) {
+  const input = el('textarea', { rows: '6', spellcheck: 'false' });
+  input.value = app.state.classes.join('\n');
+  openModal({
+    title: 'Edit classes',
+    subtitle: 'One class per line. The order sets the class id used in the exported labels.',
+    body: el('div', { class: 'block' }, [
+      input,
+      el('p', { class: 'block-note', text: 'Renaming a class keeps existing boxes pointing at the same row.' }),
+    ]),
+    actions: [
+      { label: 'Cancel', onClick: () => closeModal() },
+      {
+        label: 'Save classes',
+        kind: 'primary',
+        onClick: async () => {
+          const names = input.value.split('\n').map((s) => s.trim()).filter(Boolean);
+          if (!names.length) { toast('Add at least one class.', 'warn'); return; }
+          await api.setClasses(names);
+          closeModal();
+        },
+      },
+    ],
+  });
+}
+
+// ── 3 · Train ──────────────────────────────────────────────────
+
+export function trainPanel(app) {
+  const ui = app.ui;
+  const stats = app.state.stats || {};
+
+  // Export
+  const task = select([['detect', 'Detection — boxes'], ['segment', 'Segmentation — masks'], ['pose', 'Pose — 4 corner points']], app.state.task);
+  task.addEventListener('change', async () => {
+    await api.settings({ task: task.value });
+    app.state.task = task.value;
+    app.renderPanel();
+  });
+
+  const skip = el('input', { type: 'checkbox', ...(ui.skipUnreviewed ? { checked: 'checked' } : {}) });
+  skip.addEventListener('change', () => { ui.skipUnreviewed = skip.checked; });
+
+  const exportBtn = el('button', {
+    class: 'btn go block-btn',
+    text: 'Export labels to a folder',
+    disabled: stats.labelled ? null : 'disabled',
+    onclick: async () => {
+      const outDir = await pickPath({
+        title: 'Where should the dataset go?',
+        subtitle: 'Writes images/, labels/ and data.yaml into the folder you choose.',
+        confirmLabel: 'Export here',
+      });
+      if (!outDir) return;
+      try {
+        const res = await api.export({ outDir, task: task.value, skipUnreviewed: skip.checked });
+        ui.datasetDir = res.outDir;
+        toast(`${plural(res.frames, 'frame')} written to ${res.outDir}`, 'ok', 'Exported');
+        app.renderPanel();
+      } catch (err) { toast(err.message, 'error', 'Export failed'); }
+    },
+  });
+
+  const exportBlock = el('div', { class: 'block' }, [
+    el('h3', {}, ['Export a dataset']),
+    field('Label format', task),
+    el('label', { class: 'inline-field' }, [skip, 'Only export frames I have reviewed']),
+    exportBtn,
+    stats.labelled
+      ? el('p', { class: 'block-note', text: `${stats.labelled} of ${stats.frames} frames carry labels. Frames with no labels are never exported.` })
+      : el('p', { class: 'block-note', text: 'Nothing is labelled yet — export unlocks once you have at least one box.' }),
+  ]);
+
+  // Convert
+  const convertBlock = el('div', { class: 'block' }, [
+    el('h3', {}, ['Convert a dataset', el('small', { text: 'on disk' })]),
+    el('p', { class: 'block-note', text: 'Upgrades an exported dataset in place, writing a new folder next to it.' }),
+    el('button', {
+      class: 'btn block-btn',
+      text: 'Boxes → masks (segmentation)',
+      onclick: async () => {
+        const source = await pickPath({ title: 'Pick a detection dataset', subtitle: 'The folder must contain data.yaml.', confirmLabel: 'Convert this' });
+        if (!source) return;
+        try { await api.convertSeg({ source }); } catch (err) { toast(err.message, 'error', 'Could not start'); }
+      },
+    }),
+    el('button', {
+      class: 'btn block-btn',
+      text: 'Masks → 4 corner points (pose)',
+      onclick: () => convertPoseDialog(),
+    }),
+  ]);
+
+  // Train
+  const models = app.models?.[app.state.task] || [];
+  const model = select(models, models.includes(ui.model) ? ui.model : models[0]);
+  model.addEventListener('change', () => { ui.model = model.value; });
+  ui.model = model.value;
+
+  const epochs = num(ui.epochs, { min: 1, max: 2000 });
+  epochs.addEventListener('change', () => { ui.epochs = +epochs.value || 50; });
+  const imgsz = select([['320', '320'], ['512', '512'], ['640', '640 (default)'], ['960', '960'], ['1280', '1280']], String(ui.imgsz));
+  imgsz.addEventListener('change', () => { ui.imgsz = +imgsz.value; });
+  const cache = select([['off', 'Off — lowest memory'], ['disk', 'Disk'], ['ram', 'RAM — fastest, heaviest']], ui.cache);
+  cache.addEventListener('change', () => { ui.cache = cache.value; });
+  const workers = num(ui.workers, { min: 0, max: 16 });
+  workers.addEventListener('change', () => { ui.workers = +workers.value; });
+
+  const datasetRow = pathField(ui, 'datasetDir', {
+    placeholder: 'Choose the exported dataset folder',
+    onPick: async () => {
+      const dir = await pickPath({ title: 'Pick the dataset to train on', subtitle: 'The folder that holds data.yaml.', confirmLabel: 'Train on this' });
+      if (dir) { ui.datasetDir = dir; app.renderPanel(); }
+    },
+  });
+
+  const startTraining = async (confirm = false) => {
+    if (!ui.datasetDir) { toast('Choose a dataset folder first.', 'warn'); return; }
+    try {
+      const res = await api.train({
+        model: model.value,
+        epochs: +epochs.value,
+        imgsz: +imgsz.value,
+        cache: cache.value,
+        workers: +workers.value,
+        datasetDir: ui.datasetDir,
+        confirm,
+      });
+      if (res.needsConfirm) {
+        const ok = await confirmDialog({
+          title: 'Model and dataset do not match',
+          message: res.warnings.join('\n\n'),
+          confirmLabel: 'Train anyway',
+          danger: true,
+        });
+        if (ok) startTraining(true);
+      }
+    } catch (err) { toast(err.message, 'error', 'Could not start training'); }
+  };
+
+  const trainBlock = el('div', { class: 'block' }, [
+    el('h3', {}, ['Train a model']),
+    field('Dataset', datasetRow),
+    field('Model', model),
+    el('div', { class: 'field-row' }, [field('Epochs', epochs), field('Image size', imgsz)]),
+    el('div', { class: 'field-row' }, [field('Image cache', cache), field('Loader workers', workers)]),
+    el('button', { class: 'btn go block-btn', text: 'Start training', onclick: () => startTraining(false) }),
+    el('p', { class: 'block-note', text: 'Progress shows at the bottom of the window, with a Stop button that keeps the epochs already finished.' }),
+  ]);
+
+  // ONNX
+  const prec = select(['FP32', 'FP16'], ui.precision);
+  prec.addEventListener('change', () => { ui.precision = prec.value; });
+  const shape = select([['dynamic', 'Dynamic — any input size'], ['static', 'Static — fixed input size']], ui.shape);
+  shape.addEventListener('change', () => { ui.shape = shape.value; });
+
+  const onnxBlock = el('div', { class: 'block' }, [
+    el('h3', {}, ['Export to ONNX']),
+    el('div', { class: 'field-row' }, [field('Precision', prec), field('Input shape', shape)]),
+    el('button', {
+      class: 'btn block-btn',
+      text: 'Pick a .pt file and export',
+      onclick: async () => {
+        const ptPath = await pickPath({
+          title: 'Pick a trained checkpoint',
+          subtitle: 'Trained weights live under runs/train/…/weights/best.pt',
+          want: '.pt',
+          confirmLabel: 'Export this',
+        });
+        if (!ptPath) return;
+        try {
+          await api.onnx({ ptPath, precision: prec.value, dynamic: shape.value === 'dynamic', imgsz: +imgsz.value });
+        } catch (err) { toast(err.message, 'error', 'Export failed'); }
+      },
+    }),
+    el('p', { class: 'block-note', text: 'Exports at the image size set above. FP16 needs a CUDA GPU, and an export runs to completion once started.' }),
+  ]);
+
+  return el('div', { class: 'panel-inner' }, [
+    exportBlock, el('hr', { class: 'rule' }),
+    trainBlock, el('hr', { class: 'rule' }),
+    convertBlock, el('hr', { class: 'rule' }),
+    onnxBlock,
+  ]);
+}
+
+function convertPoseDialog() {
+  const margin = num(2, { min: 0, max: 49, step: 0.5 });
+  openModal({
+    title: 'Masks → 4 corner points',
+    subtitle: 'Reads polygon labels and writes the four corners of each shape as pose keypoints.',
+    body: el('div', { class: 'block' }, [
+      field('Drop points within this % of an image edge', margin,
+        'Corners touching the border are usually cut off, so they make poor keypoints. They are kept as removable ghosts you can restore while labelling.'),
+    ]),
+    actions: [
+      { label: 'Cancel', onClick: () => closeModal() },
+      {
+        label: 'Choose dataset',
+        kind: 'primary',
+        onClick: async () => {
+          const edgeMargin = +margin.value;
+          closeModal();
+          const source = await pickPath({ title: 'Pick a segmentation dataset', subtitle: 'The folder must contain data.yaml with task: segment.', confirmLabel: 'Convert this' });
+          if (!source) return;
+          try { await api.convertPose({ source, edgeMargin }); } catch (err) { toast(err.message, 'error', 'Could not start'); }
+        },
+      },
+    ],
+  });
+}

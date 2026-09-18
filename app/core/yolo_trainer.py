@@ -2,14 +2,15 @@
 YOLO training wrapper.
 
 MODEL_REGISTRY maps UI display names to Ultralytics weight filenames.
-DETECTION_MODELS / SEGMENTATION_MODELS provide pre-filtered lists for the UI.
+DETECTION_MODELS / SEGMENTATION_MODELS / POSE_MODELS are pre-filtered lists
+for the UI.  train_yolo() runs a training job and can be stopped mid-run.
 """
 
 from __future__ import annotations
 
 import os
 
-from qtpy.QtCore import QThread, Signal
+from typing import Callable
 
 # Project root = two levels up from app/core/yolo_trainer.py
 _PROJECT_ROOT = os.path.normpath(
@@ -76,7 +77,7 @@ MODEL_REGISTRY: dict[str, str] = {
     "YOLO11l-seg":   "yolo11l-seg.pt",
     # v12 / v26 support the segment task but have no published -seg.pt weights;
     # these are built from the architecture YAML and transfer-load the detection
-    # backbone (see SEG_TRANSFER_BASE / YOLOTrainWorker._build_model).
+    # backbone (see SEG_TRANSFER_BASE / _build_model).
     "YOLO12n-seg":   "yolo12n-seg.yaml",
     "YOLO12s-seg":   "yolo12s-seg.yaml",
     "YOLO12m-seg":   "yolo12m-seg.yaml",
@@ -131,118 +132,117 @@ def _is_sam2_key(key: str) -> bool:
     return key.startswith("SAM 2")
 
 
-class YOLOTrainWorker(QThread):
+def _build_model(YOLO, model_key: str):
+    """Construct the YOLO model for *model_key*.
+
+    Most models load directly from a pretrained .pt.  Seg models that have no
+    published -seg.pt (v12 / v26) are mapped to a .yaml architecture and
+    transfer-load the matching detection backbone for a warm start.
     """
-    Runs YOLO training in a background thread.
+    weights = MODEL_REGISTRY[model_key]
+    model = YOLO(weights)
 
-    ultralytics YOLO.train() is blocking; the on_train_epoch_end callback
-    fires on this thread, so Signal.emit() is safe (Qt queues cross-thread
-    signals automatically).
+    if weights.endswith(".yaml"):
+        base = SEG_TRANSFER_BASE.get(model_key)
+        if base:
+            try:
+                model = model.load(base)  # transfer detection backbone
+            except Exception:
+                # No compatible pretrained weights available — train the
+                # architecture from scratch rather than failing outright.
+                pass
+    return model
+
+
+def metric_label_for(model_key: str) -> str:
+    if _is_pose_key(model_key):
+        return "mAP50-pose"
+    if _is_seg_key(model_key):
+        return "mAP50-mask"
+    return "mAP50"
+
+
+def _epoch_metric(metrics: dict, model_key: str) -> float:
+    if _is_pose_key(model_key):
+        return float(metrics.get("metrics/mAP50(P)", 0.0) or metrics.get("mAP50", 0.0))
+    if _is_seg_key(model_key):
+        # Prefer mask mAP50; fall back to box mAP50
+        return float(
+            metrics.get("metrics/mAP50(M)", 0.0)
+            or metrics.get("metrics/mAP50(B)", 0.0)
+            or metrics.get("mAP50", 0.0)
+        )
+    return float(metrics.get("metrics/mAP50(B)", 0.0) or metrics.get("mAP50", 0.0))
+
+
+def train_yolo(
+    model_key: str,
+    data_yaml: str,
+    *,
+    epochs: int = 50,
+    imgsz: int = 640,
+    batch: int | float = -1,
+    cache: bool | str = False,
+    workers: int = 4,
+    project: str | None = None,
+    name: str = "exp",
+    on_epoch: Callable[[int, int, float], None] | None = None,
+    on_log: Callable[[str], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> dict:
     """
+    Train an Ultralytics model, reporting progress per epoch.
 
-    epoch_done = Signal(int, int, float)  # (current_epoch, total_epochs, map50)
-    finished   = Signal(str)              # path to best weights file
-    error      = Signal(str)
+    ``should_stop`` is polled after every batch and epoch; when it returns True
+    Ultralytics is asked to finish early and the best-so-far weights are kept,
+    so pressing Stop never throws away completed epochs.
+    """
+    from ultralytics import YOLO
 
-    def __init__(
-        self,
-        model_key: str,
-        data_yaml: str,
-        epochs: int = 50,
-        imgsz: int = 640,
-        project: str | None = None,
-        name: str = "exp",
-        cache: bool | str = False,
-        workers: int = 4,
-        parent=None,
-    ):
-        super().__init__(parent)
-        if model_key not in MODEL_REGISTRY:
-            raise ValueError(f"Unknown model key: {model_key!r}")
-        self.model_key     = model_key
-        self.data_yaml     = data_yaml
-        self.epochs        = epochs
-        self.imgsz         = imgsz
-        # Absolute path keeps training runs inside the project root.
-        self.project       = project or os.path.join(RUNS_DIR, "train")
-        self.name          = name
-        self.cache         = cache
-        self.workers       = workers
-        self._total_epochs = epochs
-        self._is_seg       = _is_seg_key(model_key)
-        self._is_pose      = _is_pose_key(model_key)
+    if model_key not in MODEL_REGISTRY:
+        raise ValueError(f"Unknown model key: {model_key!r}")
 
-    def _build_model(self, YOLO):
-        """Construct the YOLO model for self.model_key.
+    configure_ultralytics_dirs()  # keep all outputs inside the project root
+    model = _build_model(YOLO, model_key)
+    project = project or os.path.join(RUNS_DIR, "train")
+    stopped = {"value": False}
 
-        Most models load directly from a pretrained .pt.  Seg models that have
-        no published -seg.pt (v12 / v26) are mapped to a .yaml architecture and
-        transfer-load the matching detection backbone for a warm start.
-        """
-        weights = MODEL_REGISTRY[self.model_key]
-        model = YOLO(weights)
+    def _check_stop(trainer) -> None:
+        if should_stop and should_stop():
+            stopped["value"] = True
+            # BaseTrainer checks `stop` at the end of each epoch to break out.
+            trainer.stop = True
+            trainer.epochs = min(getattr(trainer, "epochs", epochs), trainer.epoch + 1)
 
-        if weights.endswith(".yaml"):
-            base = SEG_TRANSFER_BASE.get(self.model_key)
-            if base:
-                try:
-                    model = model.load(base)  # transfer detection backbone
-                except Exception:
-                    # No compatible pretrained weights available — train the
-                    # architecture from scratch rather than failing outright.
-                    pass
-        return model
+    def _on_epoch_end(trainer) -> None:
+        epoch = trainer.epoch + 1
+        value = _epoch_metric(trainer.metrics or {}, model_key)
+        if on_epoch:
+            on_epoch(epoch, epochs, value)
+        if on_log:
+            on_log(f"epoch {epoch}/{epochs}  {metric_label_for(model_key)}={value:.4f}")
+        _check_stop(trainer)
 
-    def run(self) -> None:
-        try:
-            from ultralytics import YOLO
+    model.add_callback("on_train_epoch_end", _on_epoch_end)
+    model.add_callback("on_train_batch_end", _check_stop)
 
-            configure_ultralytics_dirs()  # keep all outputs inside the project root
+    results = model.train(
+        data=data_yaml,
+        epochs=epochs,
+        imgsz=imgsz,
+        project=project,
+        name=name,
+        exist_ok=True,
+        verbose=False,
+        batch=batch,
+        cache=cache,
+        workers=workers,
+    )
 
-            model = self._build_model(YOLO)
-
-            is_seg  = self._is_seg
-            is_pose = self._is_pose
-
-            def _on_epoch_end(trainer) -> None:
-                epoch = trainer.epoch + 1
-                m = trainer.metrics
-                if is_pose:
-                    map50 = float(
-                        m.get("metrics/mAP50(P)", 0.0)
-                        or m.get("mAP50", 0.0)
-                    )
-                elif is_seg:
-                    # For seg models prefer mask mAP50; fall back to box mAP50
-                    map50 = float(
-                        m.get("metrics/mAP50(M)", 0.0)
-                        or m.get("metrics/mAP50(B)", 0.0)
-                        or m.get("mAP50", 0.0)
-                    )
-                else:
-                    map50 = float(
-                        m.get("metrics/mAP50(B)", 0.0)
-                        or m.get("mAP50", 0.0)
-                    )
-                self.epoch_done.emit(epoch, self._total_epochs, map50)
-
-            model.add_callback("on_train_epoch_end", _on_epoch_end)
-
-            results = model.train(
-                data=self.data_yaml,
-                epochs=self.epochs,
-                imgsz=self.imgsz,
-                project=self.project,
-                name=self.name,
-                exist_ok=True,
-                verbose=False,
-                batch=-1,      # auto-batch to maximise VRAM
-                cache=self.cache,
-                workers=self.workers,
-            )
-
-            best = str(getattr(results, "best", "") or "")
-            self.finished.emit(best)
-
-        except Exception as exc:
-            self.error.emit(f"Training failed: {exc}")
+    best = str(getattr(results, "best", "") or "")
+    save_dir = str(getattr(results, "save_dir", "") or project)
+    if not best:
+        candidate = os.path.join(save_dir, "weights", "best.pt")
+        if os.path.isfile(candidate):
+            best = candidate
+    return {"best": best, "save_dir": save_dir, "stopped_early": stopped["value"]}

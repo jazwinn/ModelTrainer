@@ -1,6 +1,6 @@
-# UI
-qtpy>=2.4.1
-PyQt5>=5.15.9
+# Web UI (served locally, opens in your browser)
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
 
 # Media processing
 opencv-python>=4.9.0

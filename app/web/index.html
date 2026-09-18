@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ModelTrainer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/css/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2314161b'/><rect x='7' y='9' width='18' height='14' rx='2' fill='none' stroke='%237c9cff' stroke-width='2'/><circle cx='12' cy='14' r='1.8' fill='%23f0a03c'/></svg>">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    ModelTrainer
+  </div>
+
+  <nav class="steps" id="steps" aria-label="Workflow">
+    <button class="step" data-step="media"><b>1</b> Media</button>
+    <button class="step" data-step="label"><b>2</b> Label</button>
+    <button class="step" data-step="train"><b>3</b> Train</button>
+  </nav>
+
+  <div class="topbar-meta">
+    <span id="deviceInfo" class="chip" title="Compute device"></span>
+    <span id="frameCount" class="chip"></span>
+  </div>
+</header>
+
+<main class="workbench">
+  <!-- ── Filmstrip ───────────────────────────────────────────── -->
+  <aside class="filmstrip" id="filmstrip">
+    <div class="filmstrip-head">
+      <label class="filter">
+        <select id="frameFilter" class="mini">
+          <option value="all">All frames</option>
+          <option value="labelled">Labelled</option>
+          <option value="empty">Not labelled</option>
+        </select>
+      </label>
+      <span class="filmstrip-count" id="filmstripCount"></span>
+    </div>
+    <div class="strip" id="strip" role="listbox" aria-label="Frames"></div>
+    <p class="filmstrip-empty" id="filmstripEmpty">No frames yet.<br>Import media to begin.</p>
+  </aside>
+
+  <!-- ── Stage ───────────────────────────────────────────────── -->
+  <section class="stage" id="stage">
+    <div class="stage-toolbar" id="stageToolbar">
+      <div class="toolgroup" id="toolButtons">
+        <button class="tool" data-tool="select" title="Select and edit (V)"><span class="ico">⬚</span>Select</button>
+        <button class="tool" data-tool="draw" title="Draw a box (B)"><span class="ico">✛</span>Draw box</button>
+        <button class="tool tool-pos" data-tool="pos" title="Mark an example to find (E)"><span class="ico">＋</span>Example</button>
+        <button class="tool tool-neg" data-tool="neg" title="Mark something to exclude (X)"><span class="ico">－</span>Exclude</button>
+      </div>
+
+      <label class="inline-field">
+        Class
+        <select id="activeClass" class="mini"></select>
+      </label>
+
+      <div class="toolgroup right">
+        <button class="ghost" id="undoBtn" title="Undo (Ctrl+Z)">Undo</button>
+        <button class="ghost" id="clearFrameBtn" title="Remove every box on this frame">Clear frame</button>
+        <button class="ghost" id="dropFrameBtn" title="Drop this frame from the session">Drop frame</button>
+        <span class="divider"></span>
+        <button class="ghost" id="zoomOut" title="Zoom out">−</button>
+        <button class="ghost" id="zoomFit" title="Fit to window (F)">Fit</button>
+        <button class="ghost" id="zoomIn" title="Zoom in">+</button>
+      </div>
+    </div>
+
+    <div class="canvas-host" id="canvasHost">
+      <canvas id="canvas"></canvas>
+      <div class="stage-empty" id="stageEmpty">
+        <h2>Nothing loaded yet</h2>
+        <p>Go to <b>1 Media</b> and import a folder of images or video.</p>
+      </div>
+      <div class="stage-hud" id="stageHud"></div>
+    </div>
+
+    <div class="stage-foot">
+      <button class="ghost" id="prevFrame" title="Previous frame (←)">←</button>
+      <span id="frameLabel" class="frame-label">—</span>
+      <button class="ghost" id="nextFrame" title="Next frame (→)">→</button>
+      <span class="divider"></span>
+      <span id="boxSummary" class="muted"></span>
+      <span class="grow"></span>
+      <button class="ghost" id="reviewBtn" title="Mark this frame as checked by you">Mark reviewed</button>
+      <span id="saveState" class="muted"></span>
+    </div>
+  </section>
+
+  <!-- ── Step panel ──────────────────────────────────────────── -->
+  <aside class="panel" id="panel"></aside>
+</main>
+
+<!-- ── Job bar ───────────────────────────────────────────────── -->
+<div class="jobbar" id="jobbar" hidden></div>
+
+<!-- ── Toasts ────────────────────────────────────────────────── -->
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<!-- ── Modal host ────────────────────────────────────────────── -->
+<div class="modal-backdrop" id="modalBackdrop" hidden>
+  <div class="modal" id="modal" role="dialog" aria-modal="true"></div>
+</div>
+
+<script type="module" src="/static/js/app.js"></script>
+</body>
+</html>

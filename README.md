@@ -1,136 +1,174 @@
 # Model Trainer
 
-A powerful, native desktop application for dataset annotation and computer vision model training. Model Trainer integrates Meta's state-of-the-art **SAM 3** (Segment Anything Model 3) for zero-shot auto-labeling and visual tracking, along with **Ultralytics YOLO** for seamless, localized model training—all within a single, hardware-accelerated GUI.
+Label datasets and train computer-vision models from your browser. Model Trainer runs a
+small local server on your own machine and serves its interface to `localhost` — your
+images, labels and GPU never leave the computer. It wraps Meta's **SAM 3** for zero-shot
+auto-labelling and **Ultralytics YOLO** for training, export and ONNX conversion.
 
 ![ModelTrainer UI](Resource/ReadMePic.jpg)
 
-## Features
+## Install and run
 
-### Media Import & Management
-* **Flexible Import Modes:** Replace All (fresh start), Add More (append frames), or Import YOLO Dataset (load existing annotations + class names).
-* **Video Frame Sampling:** Reduce video import size with adjustable stride (e.g., stride=5 keeps 1 in 5 frames, ~80% fewer files).
-* **YOLO Dataset Loader:** Automatically import existing YOLO datasets with class names from `data.yaml` and pre-populated bounding boxes from `labels/*.txt`.
+Python 3.10+ and, for anything other than a demo, a CUDA-capable NVIDIA GPU.
 
-### Annotation & Auto-Labeling
-* **Zero-Shot Auto-Labeling:** Leverage SAM 3's text-to-image capabilities to automatically find and bound objects across your entire dataset simply by typing a description (e.g., "car", "solar panel"). Fine-tune with **Start Frame** and **Stride** controls.
-* **Propagate Labels:** Extract class names from a manually-labeled seed frame and apply them as search concepts across all other frames. Use **Start Frame** to skip early frames if needed.
-* **SAM 3 Video Tracking:** Label a single frame and use SAM 3's temporal memory to visually track and propagate the bounding box across continuous video frames. Auto-warns if frame gaps from stride are too large.
-* **Interactive Prompting:** Use point-and-click positive (green) and negative (red) visual hints to interactively guide SAM 3 to segment exact, complex objects.
-* **Manual Annotation:** Fast and intuitive manual bounding box drawing with full resize and drag support.
+```bash
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+```
 
-### Training & Export
-* **YOLO Dataset Export:** Automatically format and export labeled frames into standard YOLO detection, segmentation, or pose format with a correctly structured `data.yaml` (`task`, `kpt_shape`, `names` list, forward-slash paths).
-* **Pose Keypoint Annotation:** Pose bboxes display four draggable corner keypoints (TL / TR / BR / BL). Hover to see corner labels. Right-click a keypoint to remove it (shown as a ghost dot for partially-visible objects). Right-click a ghost to restore it. Keypoints are exported with visibility flags compatible with all Ultralytics versions.
-* **Seg → Pose Conversion:** Convert any YOLO segmentation dataset to pose format in one click — no ML model required. Extracts the four geometric corners of each polygon mask. Configurable edge-margin filter automatically removes keypoints too close to the image boundary (avoids ambiguous labels). Removed corners appear as ghost dots in the Annotate tab and can be restored by clicking.
-* **Embedded YOLO Training:** Train YOLOv8, YOLOv11, or YOLO26 detection / segmentation / pose models directly inside the app. Features automatic VRAM batch scaling, configurable image caching, and real-time per-epoch mAP50 progress.
-* **Memory-Efficient Training:** Cache mode (Off / Disk / RAM) and worker count are exposed in the UI so you can trade training speed for RAM. Default is **Off** — safe for large datasets on 16–32 GB machines.
-* **ONNX Export:** Convert any trained `.pt` checkpoint to ONNX with FP32 or FP16 precision and dynamic or static input shape.
-* **GPU Acceleration:** Fully utilizes CUDA for SAM 3 inference and YOLO training. Diagnostics printed on startup.
-* **Multi-GPU Support:** Automatically selects best available device (GPU first, CPU fallback).
+*(Install the CUDA build of PyTorch if you have an NVIDIA GPU — the default wheel is CPU-only.)*
 
-## Requirements
-
-* Python 3.10+
-* A CUDA-capable NVIDIA GPU is highly recommended for reasonable SAM 3 and YOLO performance.
-* Dependencies listed in `requirements.txt`.
-
-## Installation
-
-1. Clone this repository.
-2. Create a virtual environment:
-   ```bash
-   python -m venv venv
-   venv\Scripts\activate
-   ```
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-   *(Note: Ensure you install the CUDA version of PyTorch if you are using an NVIDIA GPU for hardware acceleration).*
-
-## Usage
-
-Start the application by running the main entry point:
 ```bash
 python -m app.main
 ```
 
-### Typical Workflow
+The server starts and opens `http://localhost:8321` in your browser. Useful flags:
 
-#### Option A: Start from Scratch
-1. **Import Media:** Use **Replace All Media** to import a folder of images or videos. Adjust **Stride** to skip video frames if needed (e.g., stride=5 for large datasets).
-2. **Define Classes:** Use "Edit Classes" in the Annotate tab to add the categories you want to detect (e.g., "drone", "car").
-3. **Annotate:**
-   - Manually label a representative frame, or use **SAM 3 Prompt** to interactively refine objects on one frame.
-   - Use **Propagate Labels** to apply those class names as search concepts across all frames (or just frames after a **Start Frame** index).
-   - Alternatively, use **Run SAM 3** with a text concept (e.g., "solar module") to search across all frames.
-   - Use **Track Video** to follow labeled objects through continuous video using SAM 3's memory.
-4. **Review & Export:** Switch to thumbnails to verify labels, then click **Export YOLO** to write `.txt` files and `data.yaml`.
-5. **Train:** Click **Start Training**, pick your exported dataset folder, choose a YOLO model and epoch count, and train on GPU.
+| Flag | What it does |
+|------|--------------|
+| `--port 9000` | Serve on a different port (a busy port is skipped automatically) |
+| `--host 0.0.0.0` | Reachable from other machines on your network — only on networks you trust |
+| `--no-browser` | Start the server without opening a browser window |
 
-#### Option B: Continue an Existing Dataset
-1. **Import YOLO Dataset:** Use **Import YOLO Dataset** to load an existing folder with `images/`, `labels/`, and `data.yaml`. Class names and all boxes are auto-loaded.
-2. **Refine:** Edit boxes as needed, or use SAM 3 / Propagate to add more annotations.
-3. **Re-export & Retrain:** Export updated labels and retrain with the full dataset.
+Your session is written to `.modeltrainer/session/` as you work and comes back when you
+reopen the app, so closing the tab or restarting the server costs you nothing.
 
-#### Option C: Expand with More Media
-1. **Add More Media:** Use **Add More Media** to append images/videos to your current session without clearing existing frames and labels.
-2. **Annotate New Frames:** Run SAM 3 or Propagate on the new media using the **Start Frame** control to skip already-labeled frames.
+## The workflow
 
-## Key Controls & Parameters
+The interface has three steps across the top, and you move through them in order.
 
-### Media Tab
-| Control | Purpose |
-|---------|---------|
-| **Replace All Media** | Clear everything and import fresh folder of images/videos |
-| **Add More Media** | Append images/videos without clearing existing frames |
-| **Import YOLO Dataset** | Load a folder with `images/`, `labels/`, `data.yaml` (auto-loads class names and bboxes) |
-| **Stride** | Video frame sampling: keep 1 in every N raw frames (1 = every frame, 5 = ~80% fewer frames) |
+### 1 · Media
 
-### Annotate Tab
-| Control | Purpose |
-|---------|---------|
-| **Run SAM 3** | Auto-label frames using a text concept (e.g., "solar panel"). Searches all frames matching Stride & Start Frame. |
-| **Model** | SAM 3 version (SAM 3.1 recommended for best quality) |
-| **Stride** | Run SAM on every Nth imported frame |
-| **Start** (SAM 3) | First frame index to process (0 = from start; 50 = skip frames 0–49) |
-| **Propagate Labels** | Extract class names from current frame's boxes and search for them across all other frames |
-| **Start** (Propagate) | First frame to propagate to (excludes seed frame always) |
-| **Track Video** | Follow labeled objects through video using SAM 3's temporal memory (requires consecutive frames) |
-| **Range** | Max frames to track forward from seed frame (0 = entire video) |
+| Action | What it does |
+|--------|--------------|
+| **Import images or video** | Clears the session and imports a folder. If it happens to be a YOLO dataset, the labels and class names come with it. |
+| **Add more to what is loaded** | Appends another folder without touching existing frames. |
+| **Open an existing YOLO dataset** | Loads `images/` + `labels/` + `data.yaml`, including detection, segmentation and pose labels. |
+| **Keep 1 frame in every N** | Video sampling. 5 keeps one frame in five — far fewer files to label. Tracking needs 1. |
 
-### Train Tab
-| Control | Purpose |
-|---------|---------|
-| **Export YOLO** | Write frames + `labels/*.txt` + `data.yaml` to a folder (task auto-detected from Task selector) |
-| **Convert to Segmentation** | Convert a detection dataset (bboxes) → polygon masks using SAM 3 |
-| **Convert to Pose** | Convert a segmentation dataset (polygons) → 4-corner pose keypoints; prompts for edge-margin % |
-| **Task** | Detection / Segmentation / Pose — controls export format and model list |
-| **Model** | YOLO architecture; pose models listed when Pose task is selected |
-| **Epochs** | Training epochs |
-| **Cache** | **Off** (default, RAM-safe) / Disk / RAM — controls image pre-loading strategy |
-| **Workers** | Dataloader subprocess count (default 4); reduce to 2 if RAM is limited |
-| **Start Training** | Point to exported dataset `data.yaml` and begin training |
-| **Export to ONNX** | Convert a trained `.pt` to ONNX (FP32/FP16, Dynamic/Static shape) |
+Browse buttons open the ordinary Windows file dialog — the same Explorer window with
+the address bar, Quick access and search that every other app uses. It opens in its own
+window, so if it does not appear, look behind the browser.
 
-## Diagnostics
+A built-in folder browser is there as a fallback, and the app switches to it by itself
+when a Windows dialog cannot be shown — which is what happens if you open ModelTrainer
+from another computer, since the dialog would otherwise appear on the server's screen.
+You can also switch to it permanently with **Use the Windows file dialog** in the Media
+step, or for one pick with the button on the waiting window.
 
-On startup, the console prints:
+### 2 · Label
+
+The centre pane is the editor; the right panel holds one **Auto-label** section with four
+named methods. Only one is open at a time, each says what it does and when to use it, and
+each has a single button that starts it.
+
+| Method | What it does | Reach for it when |
+|--------|--------------|-------------------|
+| **Describe what to find** | Type a phrase; SAM 3 finds every match in each frame | The object has a name you can type — "car", "solar panel" |
+| **Point at an example** | Drag a box around one object; SAM 3 finds the others **on that frame** | The object is hard to name, or a description brings back the wrong things |
+| **Reuse this frame's labels** | Turns the classes on this frame into search terms for all the other frames | Photo sets and changing scenes, where each frame stands alone |
+| **Track through the video** | Follows the exact objects you boxed into the frames that follow | Continuous video of the same moving objects (import at stride 1) |
+
+Three settings sit under the methods and apply to all of them:
+
+* **Model** — SAM 3.1 (recommended) or SAM 3.
+* **Confidence** — lower finds more objects and more mistakes; higher keeps only sure matches.
+* **If a frame already has labels** — *Replace them*, *Keep them and add*, or *Leave that
+  frame alone*. A run that finds nothing never erases what is already on a frame.
+
+#### Editing by hand
+
+| Control | |
+|---------|--|
+| **Select** (`V`) | Click a box to select, drag to move, drag a handle to resize |
+| **Draw box** (`B`) | Drag on the image to add a box in the active class |
+| **Example** (`E`) / **Exclude** (`X`) | Green and red example boxes for *Point at an example* |
+| `←` `→` | Previous / next frame |
+| `Delete` | Remove the selected box |
+| `0`–`9` | Switch the active class (also changes the selected box) |
+| `Ctrl+Z` | Undo on the current frame |
+| `F` | Fit the image to the window |
+| Wheel / `Shift`-drag | Zoom / pan |
+| `Ctrl+S` | Save the session now (it also saves itself) |
+
+Boxes are coloured by class. A **dashed** outline means SAM suggested it and nobody has
+looked yet; a **solid** one means a human drew or adjusted it. Pose keypoints show as
+numbered corner dots — drag to move, right-click to remove, right-click a ghost to bring
+it back. **Mark reviewed** records that you have checked a frame, which the exporter can
+then filter on.
+
+### 3 · Train
+
+| Action | What it does |
+|--------|--------------|
+| **Export a dataset** | Writes `images/`, `labels/` and `data.yaml` for detection, segmentation or pose |
+| **Train a model** | YOLOv8 / 11 / 12 / 26, FastSAM or SAM 2 fine-tuning, with image size, cache mode and worker count exposed |
+| **Boxes → masks** | Upgrades a detection dataset to polygon masks using SAM 3 — no re-labelling |
+| **Masks → 4 corner points** | Converts polygons to pose keypoints geometrically; no model, seconds to run |
+| **Export to ONNX** | Converts a trained `.pt` to ONNX at FP32 or FP16, dynamic or static shape |
+
+Training warns you before starting if the model and the dataset disagree — a pose model
+against a detection dataset, for instance — and lets you go ahead anyway.
+
+## Every long job can be stopped
+
+Imports, auto-labelling, tracking, conversions and training all run as background jobs.
+A bar at the bottom of the window shows what is running, how far along it is, and a
+**Stop** button. Stopping keeps everything finished so far: imported frames stay, labels
+already written stay, and a stopped training run keeps its best checkpoint. (ONNX export
+is the one exception — it says so, because the converter cannot be interrupted safely.)
+
+## Where files go
+
+| Path | Contents |
+|------|----------|
+| `.modeltrainer/session/` | The current session: decoded frames, thumbnails, `session.json` |
+| `runs/train/exp/weights/` | Training checkpoints — `best.pt` and `last.pt` |
+| `runs/export/` | ONNX files exported from checkpoints outside the project |
+| `weights/` | Pretrained weights downloaded by Ultralytics |
+
+Ultralytics is repointed at the project root on startup, so nothing is scattered into
+global directories elsewhere on your machine.
+
+## How it fits together
+
 ```
-PyTorch version: X.X.X
-Is CUDA available? True/False
-Current CUDA device ID: 0
-GPU Device Name: NVIDIA GeForce RTX 3070
-Total GPU Memory: 8.00 GB
+app/
+  main.py            entry point — starts uvicorn, opens the browser
+  core/              Qt-free engine
+    session.py         the session: frames, classes, models, jobs
+    jobs.py            background jobs with progress and cancellation
+    media_loader.py    images and video → frames
+    sam3_handler.py    SAM 3 concept segmentation and video tracking
+    yolo_trainer.py    Ultralytics training (stoppable mid-run)
+    sam2_trainer.py    SAM 2 fine-tuning
+    yolo_seg_converter.py / yolo_pose_converter.py
+    onnx_exporter.py
+  server/            FastAPI routes, websocket event bus
+    api.py             every route; long work is handed to core/jobs.py
+    nativedialog.py    the Windows Explorer file dialog, via IFileOpenDialog
+    fsbrowse.py        the built-in folder browser used as a fallback
+  web/               the interface — plain HTML, CSS and ES modules, no build step
+  utils/             YOLO dataset writer
 ```
 
-If `CUDA available? False`, both SAM 3 and YOLO will run on CPU (much slower). Install the CUDA version of PyTorch for GPU acceleration.
+Nothing in `core/` knows about HTTP, so the engine is equally usable from a script.
 
-## Architecture
+## Troubleshooting
 
-* **UI Layer:** PyQt/PySide6
-* **Inference Layer:** Hugging Face `transformers` (SAM 3, SAM 3 Video Tracker)
-* **Training Layer:** `ultralytics` YOLO API
+**"CPU only" in the top-right.** PyTorch cannot see your GPU. SAM 3 and training still
+work but are much slower. Install the CUDA build of PyTorch.
+
+**The first SAM 3 run takes a minute.** The model is downloaded once and then loaded into
+VRAM; later runs in the same session reuse it.
+
+**Tracking loses objects.** The tracker follows objects between neighbouring frames. If
+the video was imported keeping 1 frame in 5, objects jump too far between frames — the
+app warns you. Re-import at stride 1, or use *Reuse this frame's labels* instead.
+
+**Training runs out of memory.** Set **Image cache** to *Off* and lower **Loader workers**.
+Batch size is chosen automatically from free VRAM.
 
 ## License
 

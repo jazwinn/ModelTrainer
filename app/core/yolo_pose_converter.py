@@ -30,7 +30,6 @@ from typing import Callable
 import cv2
 import numpy as np
 import yaml
-from qtpy.QtCore import QThread, Signal
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 _log = logging.getLogger(__name__)
@@ -128,12 +127,14 @@ class YoloPoseConverter:
         edge_margin: float = 0.02,
         progress_callback: Callable[[int, int], None] | None = None,
         status_callback: Callable[[str], None] | None = None,
+        should_abort: Callable[[], bool] | None = None,
     ) -> None:
         self.source_root = Path(source_root)
         self.output_root = Path(output_root)
         self.edge_margin = max(0.0, min(0.49, edge_margin))
         self._progress_callback = progress_callback
         self._status_callback = status_callback
+        self._should_abort = should_abort
 
     def _emit_status(self, msg: str) -> None:
         if self._status_callback:
@@ -177,7 +178,11 @@ class YoloPoseConverter:
             f"Found {total} images. Extracting 4 corner keypoints (TL, TR, BR, BL)…"
         )
 
+        aborted = False
         for i, (split_name, img_path, lbl_path) in enumerate(all_pairs):
+            if self._should_abort and self._should_abort():
+                aborted = True
+                break
             self._emit_status(f"{i + 1}/{total}  {img_path.name}")
 
             out_img_dir = self.output_root / "images"
@@ -199,7 +204,7 @@ class YoloPoseConverter:
         self._write_yaml(self.output_root, yaml_data, active_splits)
 
         return {
-            "status": "success",
+            "status": "cancelled" if aborted else "success",
             "output_dir": str(self.output_root),
             "n_keypoints": 4,
             "converted_items": converted_items,
@@ -433,35 +438,3 @@ class YoloPoseConverter:
 # ---------------------------------------------------------------------------
 # Qt worker wrapper
 # ---------------------------------------------------------------------------
-
-class YoloPoseConverterWorker(QThread):
-    progress      = Signal(int, int)
-    status_update = Signal(str)
-    finished      = Signal(dict)
-    error         = Signal(str)
-
-    def __init__(
-        self,
-        source_root: str,
-        output_root: str,
-        edge_margin: float = 0.02,
-        parent=None,
-    ) -> None:
-        super().__init__(parent)
-        self.source_root = source_root
-        self.output_root = output_root
-        self.edge_margin = edge_margin
-
-    def run(self) -> None:
-        try:
-            converter = YoloPoseConverter(
-                source_root=self.source_root,
-                output_root=self.output_root,
-                edge_margin=self.edge_margin,
-                progress_callback=lambda cur, tot: self.progress.emit(cur, tot),
-                status_callback=lambda msg: self.status_update.emit(msg),
-            )
-            result = converter.convert()
-            self.finished.emit(result)
-        except Exception as exc:
-            self.error.emit(f"Pose conversion failed: {exc}")
