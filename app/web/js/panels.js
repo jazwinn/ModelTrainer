@@ -225,7 +225,7 @@ export function mediaPanel(app) {
           el('div', { class: 'stat' }, [el('b', { text: String(stats.labelled ?? 0) }), el('span', { text: 'labelled' })]),
           el('div', { class: 'stat' }, [el('b', { text: String(stats.boxes ?? 0) }), el('span', { text: 'objects' })]),
         ]),
-        el('p', { class: 'block-note', text: 'Your work saves itself and comes back when you reopen ModelTrainer.' }),
+        el('p', { class: 'block-note', text: 'Your work saves itself and comes back when you reopen Groundwork.' }),
         el('button', {
           class: 'btn danger block-btn',
           text: 'Clear this session',

@@ -53,14 +53,21 @@ const app = {
   suppressReload: 0,
 };
 
+const UI_KEY = 'groundwork.ui';
+const UI_KEY_LEGACY = 'modeltrainer.ui';   // what it was called before the rename
+
 function loadUi() {
   try {
-    return { ...UI_DEFAULTS, ...JSON.parse(localStorage.getItem('modeltrainer.ui') || '{}') };
+    const saved = localStorage.getItem(UI_KEY) ?? localStorage.getItem(UI_KEY_LEGACY);
+    return { ...UI_DEFAULTS, ...JSON.parse(saved || '{}') };
   } catch { return { ...UI_DEFAULTS }; }
 }
 
 function saveUi() {
-  try { localStorage.setItem('modeltrainer.ui', JSON.stringify(app.ui)); } catch { /* private mode */ }
+  try {
+    localStorage.setItem(UI_KEY, JSON.stringify(app.ui));
+    localStorage.removeItem(UI_KEY_LEGACY);
+  } catch { /* private mode */ }
 }
 
 // ── Elements ───────────────────────────────────────────────────

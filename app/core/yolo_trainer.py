@@ -24,7 +24,7 @@ def configure_ultralytics_dirs() -> str:
 
     Ultralytics keeps global runs/weights/datasets directories in
     ``%APPDATA%/Ultralytics/settings.json``; out of the box these can point
-    *outside* this project (e.g. ``C:/Users/<you>/ModelTrainer/runs``), which
+    *outside* this project (e.g. ``C:/Users/<you>/Groundwork/runs``), which
     scatters generated files. Repoint them under the project root so training
     runs, downloaded weights and datasets all stay inside it. Returns RUNS_DIR.
     """

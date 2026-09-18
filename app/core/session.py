@@ -6,7 +6,7 @@ class list, the loaded SAM 3 models, and the background jobs.  It is UI-free;
 the web layer in app/server/api.py only translates HTTP/websocket traffic into
 calls on this object.
 
-Work is autosaved to <project>/.modeltrainer/session/session.json, so closing
+Work is autosaved to <project>/.groundwork/session/session.json, so closing
 the browser (or the server) no longer throws away an afternoon of labelling.
 """
 
@@ -28,10 +28,15 @@ from app.core.sam3_handler import (
 )
 from app.core.yolo_trainer import _PROJECT_ROOT
 
-SESSION_ROOT = os.path.join(_PROJECT_ROOT, ".modeltrainer", "session")
+SESSION_ROOT = os.path.join(_PROJECT_ROOT, ".groundwork", "session")
 FRAMES_DIR = os.path.join(SESSION_ROOT, "frames")
 THUMBS_DIR = os.path.join(SESSION_ROOT, "thumbs")
 STATE_FILE = os.path.join(SESSION_ROOT, "session.json")
+
+# Sessions written before the project was renamed live here.  They are moved
+# across on first load rather than read where they lie, so that a session has
+# one home rather than two.
+_LEGACY_ROOT = os.path.join(_PROJECT_ROOT, ".modeltrainer", "session")
 
 THUMB_SIZE = 160
 
@@ -45,6 +50,48 @@ MERGE   = "merge"     # keep existing boxes and append the new ones
 SKIP    = "skip"      # leave already-labelled frames completely alone
 
 TASKS = ("detect", "segment", "pose")
+
+
+def _adopt_legacy_session() -> None:
+    """Move a session written before the rename into its new home, once.
+
+    Failing is not fatal — `load_state` falls back to reading the old folder
+    where it lies, and the frames are found by name either way.
+    """
+    if os.path.isfile(STATE_FILE) or not os.path.isdir(_LEGACY_ROOT):
+        return
+    try:
+        if os.path.isdir(SESSION_ROOT):
+            # Starting the renamed app creates this folder before there is
+            # anything to put in it.  An empty one is just in the way; one with
+            # files in it is somebody's work, so both are left where they are.
+            if any(files for _, _, files in os.walk(SESSION_ROOT)):
+                return
+            shutil.rmtree(SESSION_ROOT, ignore_errors=True)
+        os.makedirs(os.path.dirname(SESSION_ROOT), exist_ok=True)
+        os.rename(_LEGACY_ROOT, SESSION_ROOT)
+        old_parent = os.path.dirname(_LEGACY_ROOT)
+        if os.path.isdir(old_parent) and not os.listdir(old_parent):
+            os.rmdir(old_parent)
+    except OSError:
+        pass
+
+
+def _locate_frame(image_path: str) -> str | None:
+    """Find a frame whose recorded path no longer resolves.
+
+    Paths are stored absolute, so renaming or moving the project folder would
+    otherwise drop every frame on load without saying a word.  The pictures
+    travel inside the session folder, so the file name is enough to find them
+    again wherever that folder has ended up.
+    """
+    if os.path.isfile(image_path):
+        return image_path
+    for folder in (FRAMES_DIR, os.path.join(_LEGACY_ROOT, "frames")):
+        moved = os.path.join(folder, os.path.basename(image_path))
+        if os.path.isfile(moved):
+            return moved
+    return None
 
 
 class Session:
@@ -75,6 +122,9 @@ class Session:
 
         self._dirty = False
         self._autosave_stop = threading.Event()
+        # Before anything creates the new folder — an existing one is taken as
+        # a sign there is nothing to bring across.
+        _adopt_legacy_session()
         os.makedirs(FRAMES_DIR, exist_ok=True)
         os.makedirs(THUMBS_DIR, exist_ok=True)
 
@@ -145,14 +195,25 @@ class Session:
         return path
 
     def load_state(self, path: str | None = None) -> int:
-        path = path or STATE_FILE
+        if path is None:
+            _adopt_legacy_session()
+            path = STATE_FILE if os.path.isfile(STATE_FILE) else os.path.join(_LEGACY_ROOT, "session.json")
         if not os.path.isfile(path):
             return 0
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
 
-        frames = [FrameAnnotation.from_dict(d) for d in data.get("frames", [])]
-        frames = [f for f in frames if os.path.isfile(f.image_path)]
+        frames: list[FrameAnnotation] = []
+        repaired = 0
+        for entry in data.get("frames", []):
+            ann = FrameAnnotation.from_dict(entry)
+            found = _locate_frame(ann.image_path)
+            if found is None:
+                continue          # the picture is genuinely gone
+            if found != ann.image_path:
+                ann.image_path = found
+                repaired += 1
+            frames.append(ann)
 
         with self._lock:
             self.class_names = data.get("class_names") or ["object"]
@@ -162,7 +223,9 @@ class Session:
             self.mask_detail = data.get("mask_detail", maskops.DEFAULT_DETAIL)
             self.video_stride = {k: int(v) for k, v in (data.get("video_stride") or {}).items()}
             self.store = {f.frame_index: f for f in frames}
-        self._dirty = False
+        # Corrected paths are written back on the next save rather than kept
+        # only in memory, so the repair happens once and not on every start.
+        self._dirty = bool(repaired)
         return len(frames)
 
     # ──────────────────────────────────────────────────────────────

@@ -42,8 +42,8 @@ def _any_free_port(host: str) -> int:
         return sock.getsockname()[1]
 
 
-def _modeltrainer_at(host: str, port: int) -> bool:
-    """True when the thing already holding this port is a ModelTrainer server."""
+def _groundwork_at(host: str, port: int) -> bool:
+    """True when the thing already holding this port is a Groundwork server."""
     import json
     import urllib.error
     import urllib.request
@@ -57,7 +57,7 @@ def _modeltrainer_at(host: str, port: int) -> bool:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ModelTrainer — annotate and train in your browser")
+    parser = argparse.ArgumentParser(description="Groundwork — annotate and train in your browser")
     parser.add_argument("--host", default="127.0.0.1", help="interface to bind (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8321, help="port to serve on (default: 8321)")
     parser.add_argument("--no-browser", action="store_true", help="do not open a browser window")
@@ -77,9 +77,9 @@ def main() -> None:
     if not _port_is_free(args.host, port):
         # Quietly starting a second server on another port would give it its own
         # view of the same session folder, and the two would overwrite each other.
-        if _modeltrainer_at(args.host, port):
+        if _groundwork_at(args.host, port):
             running = address(port)
-            print(f"\nModelTrainer is already running at {running} — opening that one.")
+            print(f"\nGroundwork is already running at {running} — opening that one.")
             print("Close it first if you meant to start a fresh server.\n")
             if not args.no_browser:
                 webbrowser.open(running)
@@ -88,7 +88,7 @@ def main() -> None:
         print(f"\nPort {args.port} is taken by something else — using {port} instead.")
 
     url = address(port)
-    print(f"\nModelTrainer is running at {url}\nPress Ctrl+C to stop.\n")
+    print(f"\nGroundwork is running at {url}\nPress Ctrl+C to stop.\n")
     if not args.no_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
 

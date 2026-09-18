@@ -1,11 +1,17 @@
-# Model Trainer
+# Groundwork
 
-Label datasets and train computer-vision models from your browser. Model Trainer runs a
-small local server on your own machine and serves its interface to `localhost` — your
-images, labels and GPU never leave the computer. It wraps Meta's **SAM 3** for zero-shot
-auto-labelling and **Ultralytics YOLO** for training, export and ONNX conversion.
+Label datasets and train computer-vision models from your browser.
 
-![ModelTrainer UI](Resource/ReadMePic.jpg)
+Groundwork runs a small server on your own machine and serves its interface to
+`localhost` — your images, labels and GPU never leave the computer. It wraps Meta's
+**SAM 3** for zero-shot auto-labelling and **Ultralytics YOLO** for training, export and
+ONNX conversion, so a large model does the tedious part and a small fast one is trained
+from the result.
+
+![Labelling in Groundwork](docs/labelling.jpg)
+
+<sub>Screenshots use the public-domain `coins` sample from scikit-image — the outlines in
+them were produced by typing "coin" into *Describe what to find* and letting it run.</sub>
 
 ## Install and run
 
@@ -31,8 +37,13 @@ The server starts and opens `http://localhost:8321` in your browser. Useful flag
 | `--host 0.0.0.0` | Reachable from other machines on your network — only on networks you trust |
 | `--no-browser` | Start the server without opening a browser window |
 
-Your session is written to `.modeltrainer/session/` as you work and comes back when you
-reopen the app, so closing the tab or restarting the server costs you nothing.
+Your session is written to `.groundwork/session/` as you work and comes back when you
+reopen the app, so closing the tab or restarting the server costs you nothing. Frames are
+found by name inside that folder rather than by the path they were imported from, so the
+project directory can be renamed or moved without losing them.
+
+Press `Ctrl+C` in the terminal to stop the server. It finishes what it is doing, saves the
+session and exits.
 
 ## The workflow
 
@@ -52,17 +63,20 @@ the address bar, Quick access and search that every other app uses. It opens in 
 window, so if it does not appear, look behind the browser.
 
 A built-in folder browser is there as a fallback, and the app switches to it by itself
-when a Windows dialog cannot be shown — which is what happens if you open ModelTrainer
+when a Windows dialog cannot be shown — which is what happens if you open Groundwork
 from another computer, since the dialog would otherwise appear on the server's screen.
 You can also switch to it permanently with **Use the Windows file dialog** in the Media
 step, or for one pick with the button on the waiting window.
 
 ### 2 · Label
 
-The centre pane is the editor; the right panel holds one **Auto-label** section with four
-named methods. Only one is open at a time, each says what it does and when to use it, and
-each has a single button that starts it. Settings and cleanup tools fold away around them,
-and a folded section still shows what it is set to.
+The centre pane is the editor; the right panel holds the labelling tools, each section
+folded away until you need it. A folded section still shows what it is set to.
+
+![The four ways to label automatically](docs/auto-label.jpg)
+
+**Label automatically** offers four named methods. Only one is open at a time, each says
+what it does and when to use it, and each has a single button that starts it.
 
 | Method | What it does | Reach for it when |
 |--------|--------------|-------------------|
@@ -85,6 +99,8 @@ Three settings sit under the methods and apply to all of them:
 #### Editing by hand
 
 Press `?` in the app for this list at any time; the tool buttons carry their key too.
+
+![The keyboard reference](docs/shortcuts.jpg)
 
 | Keys | |
 |------|--|
@@ -185,7 +201,9 @@ nothing is clipped. Pose keypoints become the four corners of the merged box.
 Training warns you before starting if the model and the dataset disagree — a pose model
 against a detection dataset, for instance — and lets you go ahead anyway.
 
-### Image augmentation
+#### Image augmentation
+
+![Training settings and image augmentation](docs/training.jpg)
 
 Training distorts every picture before the model sees it — a shift in brightness, a flip,
 a crop, four images stitched into one — so that a few dozen labelled frames stretch much
@@ -217,7 +235,7 @@ is the one exception — it says so, because the converter cannot be interrupted
 
 | Path | Contents |
 |------|----------|
-| `.modeltrainer/session/` | The current session: decoded frames, thumbnails, `session.json` |
+| `.groundwork/session/` | The current session: decoded frames, thumbnails, `session.json` |
 | `runs/train/exp/weights/` | Training checkpoints — `best.pt` and `last.pt` |
 | `runs/export/` | ONNX files exported from checkpoints outside the project |
 | `weights/` | Pretrained weights downloaded by Ultralytics |
@@ -237,7 +255,7 @@ app/
     maskops.py         SAM masks → the outlines a seg label needs
     media_loader.py    images and video → frames
     sam3_handler.py    SAM 3 concept segmentation and video tracking
-    yolo_trainer.py    Ultralytics training (stoppable mid-run)
+    yolo_trainer.py    Ultralytics training (stoppable mid-run) and its augmentation settings
     sam2_trainer.py    SAM 2 fine-tuning
     yolo_seg_converter.py / yolo_pose_converter.py
     onnx_exporter.py
@@ -247,6 +265,7 @@ app/
     fsbrowse.py        the built-in folder browser used as a fallback
   web/               the interface — plain HTML, CSS and ES modules, no build step
   utils/             YOLO dataset writer
+docs/                the screenshots in this file
 ```
 
 Nothing in `core/` knows about HTTP, so the engine is equally usable from a script.
@@ -265,6 +284,10 @@ app warns you. Re-import at stride 1, or use *Reuse this frame's labels* instead
 
 **Training runs out of memory.** Set **Image cache** to *Off* and lower **Loader workers**.
 Batch size is chosen automatically from free VRAM.
+
+**Upgrading from when this was called ModelTrainer.** Nothing to do. An old
+`.modeltrainer/session/` folder is moved to `.groundwork/session/` the first time the app
+starts, labels and all, and your saved interface settings carry across too.
 
 ## License
 

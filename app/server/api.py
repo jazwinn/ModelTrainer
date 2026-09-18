@@ -78,7 +78,7 @@ bus = EventBus()
 session = Session()
 session.set_emitter(bus.emit)
 
-app = FastAPI(title="ModelTrainer")
+app = FastAPI(title="Groundwork")
 
 
 @app.on_event("startup")
