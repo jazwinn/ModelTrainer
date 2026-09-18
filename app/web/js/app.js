@@ -313,6 +313,7 @@ async function selectFrame(index, { scroll = false, keepSelection = false } = {}
     node?.scrollIntoView({ block: 'nearest' });
   }
   renderHud();
+  prewarmSnap();
   app.renderPanel();
 }
 
@@ -503,6 +504,20 @@ function setTool(tool) {
     btn.setAttribute('aria-pressed', btn.dataset.tool === tool ? 'true' : 'false');
   }
   renderHud();
+  prewarmSnap();
+}
+
+/**
+ * Ask the server to read this frame before a box is drawn on it.
+ *
+ * Reading the picture is nearly all of what a snap costs, and it depends only
+ * on the picture — so it can happen while the user is still choosing where to
+ * drag.  Fire and forget: if it fails, the snap reads the frame itself exactly
+ * as it used to.
+ */
+function prewarmSnap() {
+  if (app.editor?.tool !== 'snap' || app.currentIndex === null) return;
+  api.prewarm({ frame: app.currentIndex }).catch(() => {});
 }
 
 /** Outline and Snap are meaningless for box or pose datasets, so they hide. */

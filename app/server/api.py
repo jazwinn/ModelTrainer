@@ -571,6 +571,17 @@ async def autolabel_snap(payload: dict = Body(...)) -> dict:
     return {"job": job.to_dict()}
 
 
+@app.post("/api/autolabel/prewarm")
+async def autolabel_prewarm(payload: dict = Body(...)) -> dict:
+    """Get a frame ready for snapping while the user is still aiming.
+
+    Deliberately not a job: there is nothing to watch and nothing to stop, and
+    it must not make the snap that follows it look busy.
+    """
+    started = session.prewarm_frame(int(payload.get("frame", -1)))
+    return {"started": started}
+
+
 @app.post("/api/autolabel/prompt")
 async def autolabel_prompt(payload: dict = Body(...)) -> dict:
     """Find things like these: positive/negative example boxes on one frame."""

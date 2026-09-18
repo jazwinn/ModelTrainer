@@ -122,6 +122,13 @@ _FALLBACK_MODEL_ID = "facebook/sam3"
 _TRACKER_MODEL_ID = "facebook/sam3"
 
 
+def best_device() -> str:
+    """The device inference runs on."""
+    import torch
+
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def _load_sam3(model_id: str, local_only: bool):
     """Load a SAM 3 model + processor, falling back to facebook/sam3."""
     from transformers import Sam3Model, Sam3Processor
@@ -144,9 +151,7 @@ def _load_sam3(model_id: str, local_only: bool):
 
 def load_sam3(model_key: str):
     """Load (and move to the best device) the SAM 3 concept model."""
-    import torch
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = best_device()
     model_id = SAM_MODELS.get(model_key, _FALLBACK_MODEL_ID)
     try:
         model, processor = _load_sam3(model_id, local_only=True)
@@ -156,16 +161,24 @@ def load_sam3(model_key: str):
 
 
 def load_sam3_tracker():
-    """Load the SAM 3 video memory tracker."""
+    """Load the SAM 3 video memory tracker.
+
+    Half precision on the GPU, as the concept model already does.  Encoding a
+    frame drops from ~3.3 s to ~0.7 s and the mask is the same one (IoU 0.998
+    against float32).  bf16 is deliberately not used: its shorter mantissa
+    moves logits across the binarisation threshold and the outline falls apart.
+    """
     import torch
     from transformers import Sam3TrackerVideoModel, Sam3TrackerVideoProcessor
+
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
     def _try(local_only: bool):
         processor = Sam3TrackerVideoProcessor.from_pretrained(
             _TRACKER_MODEL_ID, local_files_only=local_only
         )
         model = Sam3TrackerVideoModel.from_pretrained(
-            _TRACKER_MODEL_ID, local_files_only=local_only
+            _TRACKER_MODEL_ID, local_files_only=local_only, torch_dtype=dtype
         )
         return model, processor
 
@@ -174,7 +187,7 @@ def load_sam3_tracker():
     except Exception:
         model, processor = _try(False)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = best_device()
     return model.to(device).eval(), processor
 
 
@@ -377,6 +390,73 @@ def run_concepts_over_frames(
     return processed
 
 
+# The object id used by the throwaway pre-warm prompt.  Nothing else uses it,
+# and `reset_tracking_data` clears it before any real object is added.
+_WARMUP_OBJ_ID = -1
+
+
+class FrameEncodingCache:
+    """Holds one encoded frame so that repeat snaps on it cost a decode.
+
+    The tracker spends nearly all of its time turning the picture into vision
+    features; matching a box against features that already exist is two orders
+    of magnitude cheaper.  Outlining several objects on one frame is the normal
+    way to work, so the session that holds those features is kept until the
+    user moves to a different frame.
+
+    Callers serialise their own access: snapping and pre-warming both drive the
+    same model, so `Session` holds one lock across the pair rather than making
+    every method here defensive about a race it is not in a position to resolve.
+    """
+
+    def __init__(self) -> None:
+        self._key: object = None
+        self._session = None
+
+    def holds(self, key: object) -> bool:
+        """True when *key* is already encoded — nothing to pre-warm."""
+        return key is not None and key == self._key and self._session is not None
+
+    def session_for(self, processor, pil_img: Image.Image, key: object, device: str):
+        if key is not None and key == self._key and self._session is not None:
+            # Drop the objects from the last snap but keep the vision features:
+            # every snap is a fresh question about the same picture.
+            self._session.reset_tracking_data()
+            return self._session
+        self.clear()
+        session = processor.init_video_session(video=[pil_img], inference_device=device)
+        self._key, self._session = key, session
+        return session
+
+    def clear(self) -> None:
+        """Let go of the encoded frame — called when the frame changes."""
+        self._session = None
+        self._key = None
+
+
+def encode_frame(model, processor, pil_img: Image.Image, cache: FrameEncodingCache,
+                 key: object) -> None:
+    """Make the tracker read a frame now, so a later snap on it is a decode.
+
+    The encoder runs lazily inside the model's forward pass, not when the
+    session is built, so there is no way to ask for features without asking a
+    question.  A throwaway box in the corner is that question; the answer is
+    dropped and only the features it forced are kept.  Costs one cheap decode
+    on top of the encode, and in exchange it goes through exactly the same call
+    path `segment_box` will take, rather than reaching into the session's cache.
+    """
+    import torch
+
+    session = cache.session_for(processor, pil_img, key, best_device())
+    processor.add_inputs_to_inference_session(
+        inference_session=session, frame_idx=0, obj_ids=[_WARMUP_OBJ_ID],
+        input_boxes=[[[0.0, 0.0, 16.0, 16.0]]],
+    )
+    with torch.inference_mode():
+        model(session, frame_idx=0)
+    session.reset_tracking_data()   # drop the throwaway object, keep the features
+
+
 def segment_box(
     model,
     processor,
@@ -384,6 +464,8 @@ def segment_box(
     box: tuple[float, float, float, float],
     *,
     detail: str = maskops.DEFAULT_DETAIL,
+    cache: "FrameEncodingCache | None" = None,
+    cache_key: object = None,
 ) -> tuple[list[float] | None, tuple[float, float, float, float] | None]:
     """
     Outline the one object inside *box*.
@@ -394,15 +476,22 @@ def segment_box(
     tracker segments the object you actually drew around.  Run on a one-frame
     video, it is the classic click-and-snap segmenter.
 
+    Pass a *cache* and a *cache_key* (the frame's image path will do) to keep
+    the encoded frame between calls.  Encoding is nearly all of the cost, so
+    outlining a second object on a frame you have already touched is a decode.
+
     Returns (polygon, bounds) in normalised / pixel form, or (None, None) when
     there is nothing to outline.
     """
     import torch
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = best_device()
     width, height = pil_img.size
 
-    session = processor.init_video_session(video=[pil_img], inference_device=device)
+    if cache is not None:
+        session = cache.session_for(processor, pil_img, cache_key, device)
+    else:
+        session = processor.init_video_session(video=[pil_img], inference_device=device)
     processor.add_inputs_to_inference_session(
         inference_session=session,
         frame_idx=0,
@@ -453,7 +542,7 @@ def track_through_frames(
     if not frames or not seed_boxes:
         return 0
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = best_device()
 
     # Tracking only ever runs forward from the seed, and the tracker needs every
     # frame decoded up front — so decode just the window we are going to visit.

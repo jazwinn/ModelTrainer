@@ -23,8 +23,8 @@ from app.core import boxops, maskops, media_loader
 from app.core.jobs import Job, JobManager
 from app.core.sam3_handler import (
     AnnotationStore, BBox, FrameAnnotation, SAM_MODELS,
-    load_sam3, load_sam3_tracker, run_concepts_over_frames, run_sam3,
-    segment_box, track_through_frames,
+    FrameEncodingCache, encode_frame, load_sam3, load_sam3_tracker,
+    run_concepts_over_frames, run_sam3, segment_box, track_through_frames,
 )
 from app.core.yolo_trainer import _PROJECT_ROOT
 
@@ -34,6 +34,10 @@ THUMBS_DIR = os.path.join(SESSION_ROOT, "thumbs")
 STATE_FILE = os.path.join(SESSION_ROOT, "session.json")
 
 THUMB_SIZE = 160
+
+# How long a pre-warm waits before committing to an encode, so that flipping
+# through frames does not queue one encode per frame passed through.
+PREWARM_SETTLE = 0.25
 
 # What to do with labels that already exist on a frame an auto-label run touches.
 REPLACE = "replace"   # throw away what is there and use the new boxes
@@ -62,6 +66,9 @@ class Session:
         self._sam_loaded_key: str | None = None
         self._tracker_model = None
         self._tracker_processor = None
+        self._snap_cache = FrameEncodingCache()
+        self._snap_lock = threading.Lock()   # snapping and pre-warming share a model
+        self._prewarm_want: object = None    # newest frame asked for, to skip stale work
 
         # source video path -> import stride used (drives the tracking warning)
         self.video_stride: dict[str, int] = {}
@@ -314,6 +321,7 @@ class Session:
         with self._lock:
             self.store.clear()
             self.video_stride.clear()
+        self._snap_cache.clear()  # the frame it encoded is about to be deleted
         for directory in (FRAMES_DIR, THUMBS_DIR):
             shutil.rmtree(directory, ignore_errors=True)
             os.makedirs(directory, exist_ok=True)
@@ -690,6 +698,65 @@ class Session:
 
         return self.jobs.start("prompt", f"Finding matches on frame {frame_index}", work)
 
+    @staticmethod
+    def _frame_key(image_path: str) -> tuple:
+        """Identify an encoded frame.
+
+        The modification time rides along with the path so that a re-imported
+        frame reusing a filename can never match a stale encoding.
+        """
+        return (image_path, os.path.getmtime(image_path))
+
+    def prewarm_frame(self, frame_index: int) -> bool:
+        """Encode a frame ahead of time so the next snap on it is instant.
+
+        Turning the picture into features is nearly all of what a snap costs,
+        and it only depends on the picture — not on where the box lands.  Doing
+        it while the user is still deciding where to drag turns the first snap
+        on a frame from a wait into no wait at all.
+
+        Runs on its own thread and reports nothing: it is an optimisation, and
+        a pre-warm that fails simply means the snap pays the cost as before.
+        """
+        ann = self.store.get(frame_index)
+        if ann is None or not self.wants_masks:
+            return False
+        try:
+            key = self._frame_key(ann.image_path)
+        except OSError:
+            return False
+        # Claim the frame before deciding whether there is work to do.  A
+        # pre-warm already in flight for the frame the user just left would
+        # otherwise encode it and evict the one they are looking at now.
+        self._prewarm_want = key
+        if self._snap_cache.holds(key):
+            return False
+
+        def work() -> None:
+            from PIL import Image
+
+            try:
+                # Let the frame settle first.  Someone arrowing through the
+                # filmstrip fires one of these per frame, and an encode cannot
+                # be interrupted once it starts — so the frames passed through
+                # are dropped here rather than each evicting the next.
+                time.sleep(PREWARM_SETTLE)
+                if self._prewarm_want != key:
+                    return
+                model, processor = self.ensure_tracker()
+                with self._snap_lock:
+                    # Checked again: the wait for the lock is itself a delay,
+                    # and a real snap may have encoded the frame meanwhile.
+                    if self._prewarm_want != key or self._snap_cache.holds(key):
+                        return
+                    pil = Image.open(ann.image_path).convert("RGB")
+                    encode_frame(model, processor, pil, self._snap_cache, key)
+            except Exception:
+                pass  # nothing is owed: the snap itself will encode the frame
+
+        threading.Thread(target=work, name="prewarm", daemon=True).start()
+        return True
+
     def snap_to_object(
         self,
         frame_index: int,
@@ -716,9 +783,12 @@ class Session:
             job.set_message("Fitting an outline…")
 
             pil = Image.open(ann.image_path).convert("RGB")
-            polygon, bounds = segment_box(
-                model, processor, pil, tuple(box), detail=self.mask_detail
-            )
+            key = self._frame_key(ann.image_path)
+            with self._snap_lock:
+                polygon, bounds = segment_box(
+                    model, processor, pil, tuple(box), detail=self.mask_detail,
+                    cache=self._snap_cache, cache_key=key,
+                )
             if not polygon or not bounds:
                 return {"objects": 0, "frame": frame_index, "missed": True}
 

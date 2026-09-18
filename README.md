@@ -144,6 +144,12 @@ always correct. **Outline detail** controls how closely a shape follows the mask
 mean smaller labels and faster training, so prefer the coarsest setting that still traces
 the object.
 
+Snapping is fast because nearly all of its cost is reading the picture, and that only has
+to happen once per frame. Selecting the Snap tool or opening a frame starts that read in
+the background, so by the time a box is drawn the answer is usually already a tenth of a
+second away; every further object on the same frame is quicker still. Moving to another
+frame starts again — the app keeps one frame ready, not all of them.
+
 Export writes standard YOLO segmentation labels: one polygon per object. That means one
 outline per object — a shape with a hole, or one that breaks into pieces, keeps its
 largest part. **Boxes → masks** in the Train step is still there for datasets labelled
