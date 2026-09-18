@@ -71,7 +71,6 @@ const dom = {
   canvas: document.getElementById('canvas'),
   host: document.getElementById('canvasHost'),
   stageEmpty: document.getElementById('stageEmpty'),
-  stageHud: document.getElementById('stageHud'),
   toolbar: document.getElementById('stageToolbar'),
   tools: document.getElementById('toolButtons'),
   activeClass: document.getElementById('activeClass'),
@@ -117,7 +116,6 @@ app.onMethodChange = () => {
   if (app.ui.method === 'example') setTool('pos');
   else if (app.editor?.tool === 'pos' || app.editor?.tool === 'neg') setTool('select');
   app.renderPanel();
-  renderHud();
 };
 
 // Picking a class in the toolbar also recolours whatever box is selected.
@@ -139,7 +137,6 @@ app.reloadFrame = () => reloadCurrentFrame();
 
 app.onTaskChange = () => {
   syncMaskTools();
-  renderHud();
   app.renderPanel();
 };
 
@@ -147,7 +144,6 @@ app.clearExamples = () => {
   app.editor.clearExamples();
   app.examples = { positive: [], negative: [] };
   app.renderPanel();
-  renderHud();
 };
 
 // ── Filmstrip ──────────────────────────────────────────────────
@@ -312,7 +308,6 @@ async function selectFrame(index, { scroll = false, keepSelection = false } = {}
     const node = dom.strip.querySelector(`[data-index="${index}"]`);
     node?.scrollIntoView({ block: 'nearest' });
   }
-  renderHud();
   prewarmSnap();
   app.renderPanel();
 }
@@ -503,7 +498,6 @@ function setTool(tool) {
   for (const btn of dom.tools.querySelectorAll('.tool')) {
     btn.setAttribute('aria-pressed', btn.dataset.tool === tool ? 'true' : 'false');
   }
-  renderHud();
   prewarmSnap();
 }
 
@@ -529,38 +523,6 @@ function syncMaskTools() {
   }
 }
 
-function renderHud() {
-  const notes = [];
-  const tool = app.editor?.tool;
-  if (tool === 'outline') {
-    const points = app.editor.pending?.length || 0;
-    notes.push({
-      kind: 'info',
-      html: points
-        ? `<b>${points} point${points === 1 ? '' : 's'}.</b> Click the first point or press Enter to close · right-click undoes a point · Esc starts over.`
-        : '<b>Outline mode.</b> Click around the object, point by point. Close it on the first point or with Enter.',
-    });
-  } else if (tool === 'snap') {
-    notes.push({ kind: 'info', html: '<b>Snap mode.</b> Drag a rough box around one object and SAM fits the outline to it.' });
-  } else if (tool === 'pos') {
-    notes.push({ kind: 'pos', html: '<b>Example mode.</b> Drag a box around one object you want SAM 3 to find.' });
-  } else if (tool === 'neg') {
-    notes.push({ kind: 'neg', html: '<b>Exclude mode.</b> Drag around anything that should not be matched.' });
-  }
-  // Draw mode gets no note: the lit tool button says it, and the note sat over
-  // the top-left of the picture, which is exactly where boxes tend to go.
-  const { positive, negative } = app.examples;
-  if (positive.length || negative.length) {
-    notes.push({
-      kind: 'info',
-      html: `<b>${positive.length}</b> example${positive.length === 1 ? '' : 's'} · <b>${negative.length}</b> exclusion${negative.length === 1 ? '' : 's'} — run “Point at an example” in the panel.`,
-    });
-  }
-  dom.stageHud.innerHTML = '';
-  for (const note of notes) {
-    dom.stageHud.appendChild(el('div', { class: `hud-note ${note.kind}`, html: note.html }));
-  }
-}
 
 // ── Keyboard reference ─────────────────────────────────────────
 
@@ -777,7 +739,6 @@ function handleEvent(msg) {
     case 'task':
       app.state.task = msg.task;
       syncMaskTools();
-      renderHud();
       app.renderPanel();
       break;
     case 'toast':
@@ -998,7 +959,6 @@ async function main() {
       negative: negative.map((r) => [r.x1, r.y1, r.x2, r.y2]),
     };
     app.renderPanel();
-    renderHud();
   };
 
   bind();
