@@ -23,8 +23,9 @@ from app.core.sam2_trainer import SAM2_MODELS, train_sam2
 from app.core import maskops
 from app.core.session import MERGE, REPLACE, SKIP, TASKS, Session
 from app.core.yolo_trainer import (
-    DETECTION_MODELS, POSE_MODELS, RUNS_DIR, SEGMENTATION_MODELS, _PROJECT_ROOT,
-    _is_pose_key, _is_sam2_key, _is_seg_key, metric_label_for, train_yolo,
+    AUGMENTATIONS, DETECTION_MODELS, POSE_MODELS, RUNS_DIR, SEGMENTATION_MODELS,
+    _PROJECT_ROOT, _is_pose_key, _is_sam2_key, _is_seg_key, metric_label_for,
+    train_yolo,
 )
 from app.core.onnx_exporter import export_onnx
 from app.server import fsbrowse, nativedialog
@@ -194,6 +195,7 @@ def _state(request: Request | None = None) -> dict:
         "threshold": session.threshold,
         "maskDetail": session.mask_detail,
         "maskDetails": list(maskops.DETAIL_LEVELS),
+        "augmentations": AUGMENTATIONS,
         "wantsMasks": session.wants_masks,
         "frames": session.frames_meta(),
         "jobs": session.jobs.snapshot(),
@@ -794,6 +796,7 @@ async def train(payload: dict = Body(...)) -> dict:
     imgsz = int(payload.get("imgsz", 640))
     cache = {"off": False, "disk": "disk", "ram": "ram"}.get(payload.get("cache", "off"), False)
     workers = max(0, int(payload.get("workers", 4)))
+    augment = payload.get("augment") or {}
     batch = payload.get("batch", -1)
     batch = int(batch) if batch not in (None, "", "auto", -1) else -1
     metric = metric_label_for(model_key)
@@ -803,6 +806,7 @@ async def train(payload: dict = Body(...)) -> dict:
         return train_yolo(
             model_key, data_yaml,
             epochs=epochs, imgsz=imgsz, batch=batch, cache=cache, workers=workers,
+            augment=augment,
             on_epoch=lambda e, t, v: job.set_progress(e, t, f"epoch {e}/{t} · {metric} {v:.4f}"),
             on_log=job.log,
             should_stop=lambda: job.is_cancelled,

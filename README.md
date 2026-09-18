@@ -177,13 +177,33 @@ nothing is clipped. Pose keypoints become the four corners of the merged box.
 | Action | What it does |
 |--------|--------------|
 | **Export a dataset** | Writes `images/`, `labels/` and `data.yaml` for detection, segmentation or pose |
-| **Train a model** | YOLOv8 / 11 / 12 / 26, FastSAM or SAM 2 fine-tuning, with image size, cache mode and worker count exposed |
+| **Train a model** | YOLOv8 / 11 / 12 / 26, FastSAM or SAM 2 fine-tuning, with training settings and image augmentation each behind their own section |
 | **Boxes → masks** | Upgrades a detection dataset that was labelled elsewhere to polygon masks using SAM 3 |
 | **Masks → 4 corner points** | Converts polygons to pose keypoints geometrically; no model, seconds to run |
 | **Export to ONNX** | Converts a trained `.pt` to ONNX at FP32 or FP16, dynamic or static shape |
 
 Training warns you before starting if the model and the dataset disagree — a pose model
 against a detection dataset, for instance — and lets you go ahead anyway.
+
+### Image augmentation
+
+Training distorts every picture before the model sees it — a shift in brightness, a flip,
+a crop, four images stitched into one — so that a few dozen labelled frames stretch much
+further than a few dozen. This happens on every epoch, and it happened before there was a
+panel for it; **Image augmentation** only makes the settings visible and changeable.
+
+Each slider says what its number means rather than showing a bare figure, and the section
+header says how many have been moved off their default. Your labels are never touched:
+augmentation only affects what training sees.
+
+Two are worth knowing about for overhead imagery, where there is no "up":
+
+- **Flip top to bottom** is off by default, because most photographs have an upright.
+  Pictures taken looking straight down do not, so turning it on is free variety.
+- **Rotation** is likewise off. The same argument applies.
+
+Hue and saturation only do something to colour images — on greyscale they move nothing,
+whatever they are set to.
 
 ## Every long job can be stopped
 

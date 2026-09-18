@@ -29,11 +29,15 @@ const UI_DEFAULTS = {
   nativeDialogs: true,
   mergeThreshold: 0.8,
   mergeSameClass: true,
+  // Only the settings moved off their default live here; the rest come from
+  // the server's spec, so a change to a default is picked up rather than
+  // frozen into everyone's browser.
+  augment: {},
   open: {},
 };
 
 const app = {
-  state: { classes: ['object'], task: 'detect', samModel: '', samModels: [], threshold: 0.5, frames: [], stats: {}, device: {} },
+  state: { classes: ['object'], task: 'detect', samModel: '', samModels: [], threshold: 0.5, frames: [], stats: {}, device: {}, augmentations: [] },
   models: null,
   ui: loadUi(),
   step: 'media',

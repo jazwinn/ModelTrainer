@@ -117,6 +117,97 @@ SEG_TRANSFER_BASE: dict[str, str] = {
     "YOLO26l-seg": "yolo26l.pt",
 }
 
+
+# ---------------------------------------------------------------------------
+# Augmentation
+# ---------------------------------------------------------------------------
+
+# Ultralytics augments every epoch whether or not you ask it to — these are the
+# knobs behind that, carrying the values it uses when nothing is passed.  They
+# live here rather than in the UI so the range the server accepts and the range
+# the sliders offer cannot drift apart.
+#
+# Absent on purpose: `erasing` and `auto_augment` only take effect in
+# classification training, so a slider for them would move nothing, and `bgr`
+# swaps colour channels, which is meaningless on the greyscale imagery this is
+# usually pointed at.
+#
+# `max` is the top of the slider, not the top of what Ultralytics accepts.
+# Rotation past 180° repeats and shear past about 45° destroys the picture, so
+# the sliders stop where the values stop being useful.
+AUGMENTATIONS: list[dict] = [
+    # Photometric
+    {"key": "hsv_h", "label": "Hue", "group": "photometric", "format": "amount",
+     "default": 0.015, "min": 0.0, "max": 0.2, "step": 0.005,
+     "hint": "Colour images only — greyscale has no hue to shift."},
+    {"key": "hsv_s", "label": "Saturation", "group": "photometric", "format": "amount",
+     "default": 0.7, "min": 0.0, "max": 1.0, "step": 0.05,
+     "hint": "Colour images only."},
+    {"key": "hsv_v", "label": "Brightness", "group": "photometric", "format": "amount",
+     "default": 0.4, "min": 0.0, "max": 1.0, "step": 0.05,
+     "hint": "Works on any image, greyscale included."},
+
+    # Geometric
+    {"key": "degrees", "label": "Rotation", "group": "geometric", "format": "degrees",
+     "default": 0.0, "min": 0.0, "max": 180.0, "step": 5.0,
+     "hint": "Turn this up for pictures taken looking straight down, where there is no upright."},
+    {"key": "translate", "label": "Shift", "group": "geometric", "format": "amount",
+     "default": 0.1, "min": 0.0, "max": 0.9, "step": 0.05},
+    {"key": "scale", "label": "Zoom", "group": "geometric", "format": "amount",
+     "default": 0.5, "min": 0.0, "max": 0.9, "step": 0.05},
+    {"key": "shear", "label": "Shear", "group": "geometric", "format": "degrees",
+     "default": 0.0, "min": 0.0, "max": 45.0, "step": 1.0},
+    {"key": "perspective", "label": "Perspective", "group": "geometric", "format": "amount",
+     "default": 0.0, "min": 0.0, "max": 0.001, "step": 0.0001,
+     "hint": "Tilts the picture as if the camera were off to one side. A little goes a long way."},
+    {"key": "flipud", "label": "Flip top to bottom", "group": "geometric", "format": "chance",
+     "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+     "hint": "Off by default because most photographs have an up. Overhead pictures do not, so this is free variety."},
+    {"key": "fliplr", "label": "Flip left to right", "group": "geometric", "format": "chance",
+     "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05},
+
+    # Composition
+    {"key": "mosaic", "label": "Mosaic", "group": "composition", "format": "chance",
+     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+     "hint": "Stitches four pictures into one, so the model sees objects at more sizes and against more backgrounds."},
+    {"key": "close_mosaic", "label": "Stop mosaic before the end", "group": "composition",
+     "format": "epochs", "default": 10, "min": 0, "max": 50, "step": 1, "integer": True,
+     "hint": "Trains the last few epochs on whole pictures, so the model finishes on images that look like the ones it will meet."},
+    {"key": "mixup", "label": "Mix two pictures", "group": "composition", "format": "chance",
+     "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05},
+    {"key": "cutmix", "label": "Paste a patch of another", "group": "composition", "format": "chance",
+     "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05},
+    {"key": "copy_paste", "label": "Copy objects between pictures", "group": "composition",
+     "format": "chance", "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+     "hint": "Needs outline labels — it lifts objects out along their shape."},
+]
+
+AUGMENTATION_DEFAULTS: dict = {spec["key"]: spec["default"] for spec in AUGMENTATIONS}
+
+
+def sanitise_augmentations(values: dict | None) -> dict:
+    """Keep the settings we recognise, clamped to the range the sliders offer.
+
+    Anything unknown is dropped rather than forwarded: Ultralytics takes a very
+    wide keyword set, and passing it whatever arrives would turn a typo in the
+    browser into a silent change of training behaviour.
+    """
+    if not values:
+        return {}
+    cleaned: dict = {}
+    for spec in AUGMENTATIONS:
+        raw = values.get(spec["key"])
+        if raw is None:
+            continue
+        try:
+            number = float(raw)
+        except (TypeError, ValueError):
+            continue
+        number = min(max(number, spec["min"]), spec["max"])
+        cleaned[spec["key"]] = int(round(number)) if spec.get("integer") else round(number, 5)
+    return cleaned
+
+
 def _is_seg_key(key: str) -> bool:
     return key.endswith("-seg") or key.startswith("FastSAM")
 
@@ -184,6 +275,7 @@ def train_yolo(
     batch: int | float = -1,
     cache: bool | str = False,
     workers: int = 4,
+    augment: dict | None = None,
     project: str | None = None,
     name: str = "exp",
     on_epoch: Callable[[int, int, float], None] | None = None,
@@ -196,6 +288,10 @@ def train_yolo(
     ``should_stop`` is polled after every batch and epoch; when it returns True
     Ultralytics is asked to finish early and the best-so-far weights are kept,
     so pressing Stop never throws away completed epochs.
+
+    ``augment`` overrides the image augmentation Ultralytics applies each epoch.
+    Leaving it out keeps its defaults, which are themselves not "no augmentation"
+    — see AUGMENTATIONS.
     """
     from ultralytics import YOLO
 
@@ -226,6 +322,11 @@ def train_yolo(
     model.add_callback("on_train_epoch_end", _on_epoch_end)
     model.add_callback("on_train_batch_end", _check_stop)
 
+    settings = sanitise_augmentations(augment)
+    if settings and on_log:
+        changed = {k: v for k, v in settings.items() if v != AUGMENTATION_DEFAULTS[k]}
+        on_log(f"augmentation: {changed or 'defaults'}")
+
     results = model.train(
         data=data_yaml,
         epochs=epochs,
@@ -237,6 +338,7 @@ def train_yolo(
         batch=batch,
         cache=cache,
         workers=workers,
+        **settings,
     )
 
     best = str(getattr(results, "best", "") or "")

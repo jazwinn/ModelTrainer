@@ -59,6 +59,53 @@ function select(options, value, id) {
   return node;
 }
 
+/**
+ * One augmentation setting, as a slider that says what its number means.
+ *
+ * The readout updates as the slider moves but the panel is not rebuilt, because
+ * rebuilding mid-drag takes the slider out from under the pointer. The summary
+ * on the closed section catches up the next time the panel renders.
+ */
+function augSlider(app, spec) {
+  const value = augValue(app, spec);
+  const input = el('input', {
+    type: 'range',
+    min: String(spec.min), max: String(spec.max), step: String(spec.step),
+    value: String(value),
+  });
+  const readout = el('span', { class: 'block-note', text: augReadout(spec, value) });
+
+  input.addEventListener('input', () => { readout.textContent = augReadout(spec, +input.value); });
+  input.addEventListener('change', () => {
+    app.ui.augment = { ...(app.ui.augment || {}), [spec.key]: +input.value };
+  });
+
+  return el('label', { class: 'field' }, [
+    el('span', { text: spec.label }),
+    input,
+    readout,
+    spec.hint ? el('span', { class: 'block-note dim', text: spec.hint }) : null,
+  ]);
+}
+
+function augValue(app, spec) {
+  const set = app.ui.augment || {};
+  return set[spec.key] === undefined ? spec.default : set[spec.key];
+}
+
+/** Say what the number does, not just what it is. */
+function augReadout(spec, value) {
+  const isDefault = Math.abs(value - spec.default) < 1e-9;
+  const tail = isDefault ? ' · default' : '';
+  if (value === 0 && spec.format !== 'epochs') return `off${tail}`;
+  switch (spec.format) {
+    case 'chance':  return `${Math.round(value * 100)}% of images${tail}`;
+    case 'degrees': return `up to ±${value}°${tail}`;
+    case 'epochs':  return value === 0 ? `never${tail}` : `for the last ${plural(value, 'epoch')}${tail}`;
+    default:        return `±${value}${tail}`;
+  }
+}
+
 function pathField(state, key, { placeholder, onPick }) {
   const label = el('button', {
     class: `picker-path ${state[key] ? 'set' : ''}`,
@@ -735,6 +782,7 @@ export function trainPanel(app) {
         imgsz: +imgsz.value,
         cache: cache.value,
         workers: +workers.value,
+        augment: augmentValues(app),
         datasetDir: ui.datasetDir,
         confirm,
       });
@@ -750,12 +798,25 @@ export function trainPanel(app) {
     } catch (err) { toast(err.message, 'error', 'Could not start training'); }
   };
 
+  const settingsBlock = disclosure(app, {
+    id: 'trainsettings',
+    title: 'Training settings',
+    summary: `${plural(ui.epochs, 'epoch')} · ${ui.imgsz}px`,
+    children: [
+      el('div', { class: 'field-row' }, [field('Epochs', epochs), field('Image size', imgsz)]),
+      el('div', { class: 'field-row' }, [field('Image cache', cache), field('Loader workers', workers)]),
+      el('p', { class: 'block-note', text: 'Cache trades memory for speed. Fewer loader workers if the machine struggles.' }),
+    ],
+  });
+
+  const augmentBlock = augmentDisclosure(app);
+
   const trainBlock = el('div', { class: 'block' }, [
     el('h3', {}, ['Train a model']),
     field('Dataset', datasetRow),
     field('Model', model),
-    el('div', { class: 'field-row' }, [field('Epochs', epochs), field('Image size', imgsz)]),
-    el('div', { class: 'field-row' }, [field('Image cache', cache), field('Loader workers', workers)]),
+    settingsBlock,
+    augmentBlock,
     el('button', { class: 'btn go block-btn', text: 'Start training', onclick: () => startTraining(false) }),
     el('p', { class: 'block-note', text: 'Progress shows at the bottom of the window, with a Stop button that keeps the epochs already finished.' }),
   ]);
@@ -799,6 +860,70 @@ export function trainPanel(app) {
     convertBlock,
     onnxBlock,
   ]);
+}
+
+// ── Image augmentation ─────────────────────────────────────────
+//
+// Training already distorts every picture it shows the model — a little colour
+// shift, a flip, a crop, four images stitched together — so that 40 labelled
+// frames stretch further than 40. That happens whether or not anyone asks for
+// it; all this does is show the settings and let them be changed.
+
+const AUG_GROUPS = [
+  ['geometric', 'Shape and position', 'Moving the picture teaches the model that an object is the same object wherever it lands.'],
+  ['photometric', 'Light and colour', 'Changing the light teaches it that an object is the same object in a different exposure.'],
+  ['composition', 'Combining pictures', 'Building new pictures out of old ones. Strong medicine, and the first thing to turn down if training goes strange.'],
+];
+
+/** Every value, including the ones left at their default. */
+function augmentValues(app) {
+  const specs = app.state.augmentations || [];
+  const set = app.ui.augment || {};
+  const out = {};
+  for (const spec of specs) {
+    out[spec.key] = set[spec.key] === undefined ? spec.default : set[spec.key];
+  }
+  return out;
+}
+
+function augmentChangedCount(app) {
+  const specs = app.state.augmentations || [];
+  const set = app.ui.augment || {};
+  return specs.filter((s) => set[s.key] !== undefined
+                          && Math.abs(set[s.key] - s.default) > 1e-9).length;
+}
+
+function augmentDisclosure(app) {
+  const specs = app.state.augmentations || [];
+  const changed = augmentChangedCount(app);
+
+  const children = [
+    el('p', { class: 'block-note', text: 'Applied fresh every epoch, so the model rarely sees the same picture twice. Your labels are not touched — these only affect what training sees.' }),
+  ];
+
+  for (const [group, title, note] of AUG_GROUPS) {
+    const inGroup = specs.filter((s) => s.group === group);
+    if (!inGroup.length) continue;
+    children.push(el('div', { class: 'aug-group' }, [
+      el('h4', { text: title }),
+      el('p', { class: 'block-note', text: note }),
+      ...inGroup.map((spec) => augSlider(app, spec)),
+    ]));
+  }
+
+  children.push(el('button', {
+    class: 'btn block-btn',
+    text: 'Put everything back to its default',
+    disabled: changed ? null : 'disabled',
+    onclick: () => { app.ui.augment = {}; app.renderPanel(); },
+  }));
+
+  return disclosure(app, {
+    id: 'augment',
+    title: 'Image augmentation',
+    summary: changed ? `${changed} changed` : 'defaults',
+    children,
+  });
 }
 
 function convertPoseDialog() {
