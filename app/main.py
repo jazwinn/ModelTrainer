@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import signal
 import socket
 import threading
+import time
 import webbrowser
 
 
@@ -90,7 +92,49 @@ def main() -> None:
     if not args.no_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
 
-    uvicorn.run(app, host=args.host, port=port, log_level="warning")
+    _serve(uvicorn, app, args.host, port)
+
+
+def _serve(uvicorn, app, host: str, port: int) -> None:
+    """Run the server, and stop it cleanly on Ctrl+C.
+
+    `uvicorn.run` would do this in one line, but it re-raises the signal it
+    caught once the server is already shutting down.  That arrives as a
+    KeyboardInterrupt inside the event loop's own teardown, and the tasks it
+    cancels on the way are then reported as application errors — so an ordinary
+    Ctrl+C printed two pages of traceback.
+
+    uvicorn only installs signal handling when it is on the main thread, so
+    running it elsewhere leaves the signal to us and stopping becomes a request
+    like any other.
+    """
+    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning"))
+    thread = threading.Thread(target=server.run, name="uvicorn", daemon=True)
+    thread.start()
+
+    asked_to_stop = threading.Event()
+
+    def on_signal(signum, frame) -> None:
+        if asked_to_stop.is_set():
+            print("Forcing it.")
+            server.force_exit = True
+            return
+        print("\nStopping...")
+        asked_to_stop.set()
+        server.should_exit = True
+
+    # Ctrl+Break as well as Ctrl+C, because uvicorn used to handle both and
+    # Python's own SIGBREAK would otherwise kill the process where it stands.
+    for name in ("SIGINT", "SIGBREAK", "SIGTERM"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            signal.signal(sig, on_signal)
+
+    # Waiting with `thread.join` would hang: on Windows a lock wait is not
+    # interruptible, so the handler above would never get to run.  A sleep is.
+    while thread.is_alive():
+        time.sleep(0.2)
+    print("Stopped.")
 
 
 if __name__ == "__main__":

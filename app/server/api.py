@@ -118,18 +118,43 @@ async def index() -> HTMLResponse:
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
+    """Push state to one open tab until it goes away.
+
+    The browser never sends anything up this socket, so it would be natural to
+    only ever wait on the queue — but then nothing ends this task when the tab
+    closes or the server is asked to stop, and a shutdown waits forever on a
+    task that cannot finish.  So the wait is on either the next event or the
+    connection ending, whichever comes first.
+    """
     await ws.accept()
     queue = bus.subscribe()
+
+    async def until_gone() -> None:
+        while True:
+            message = await ws.receive()
+            if message.get("type") == "websocket.disconnect":
+                return
+
+    gone = asyncio.create_task(until_gone())
+    nxt: asyncio.Task | None = None
     try:
         await ws.send_json({"type": "hello", "state": _state(ws)})
         while True:
-            payload = await queue.get()
-            await ws.send_json(payload)
-    except WebSocketDisconnect:
+            nxt = asyncio.create_task(queue.get())
+            done, _ = await asyncio.wait({nxt, gone}, return_when=asyncio.FIRST_COMPLETED)
+            if nxt not in done:
+                break
+            await ws.send_json(nxt.result())
+    except (WebSocketDisconnect, asyncio.CancelledError):
+        # CancelledError is a BaseException, so the clause below never sees it.
+        # Letting it out turns an ordinary shutdown into a page of traceback.
         pass
     except Exception:
         pass
     finally:
+        for task in (nxt, gone):
+            if task is not None and not task.done():
+                task.cancel()
         bus.unsubscribe(queue)
 
 
