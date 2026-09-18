@@ -19,7 +19,7 @@ import threading
 import time
 from typing import Callable, Iterable
 
-from app.core import media_loader
+from app.core import boxops, media_loader
 from app.core.jobs import Job, JobManager
 from app.core.sam3_handler import (
     AnnotationStore, BBox, FrameAnnotation, SAM_MODELS,
@@ -242,6 +242,53 @@ class Session:
         meta = self.frame_meta(ann)
         self.emit({"type": "frame", "event": "updated", "frame": meta})
         return meta
+
+    # ──────────────────────────────────────────────────────────────
+    # Merging
+    # ──────────────────────────────────────────────────────────────
+
+    def merge_boxes_on_frame(self, index: int, box_indices: list[int]) -> list[BBox]:
+        """Replace the chosen boxes on one frame with a single box covering them."""
+        ann = self.store.get(index)
+        if ann is None:
+            raise ValueError(f"Frame {index} is not loaded.")
+        self._read_size(ann)
+        merged = boxops.merge_selection(ann.boxes, box_indices, ann.width, ann.height)
+        self.set_boxes(index, merged, status="verified")
+        return merged
+
+    def merge_overlapping(
+        self,
+        frames: Iterable[int] | None = None,
+        *,
+        threshold: float = 0.8,
+        same_class_only: bool = True,
+        should_abort: Callable[[], bool] | None = None,
+    ) -> dict:
+        """Fold stacked duplicate boxes together across the given frames."""
+        targets = list(frames) if frames is not None else sorted(self.store)
+        changed = 0
+        removed = 0
+
+        for index in targets:
+            if should_abort and should_abort():
+                break
+            ann = self.store.get(index)
+            if ann is None or len(ann.boxes) < 2:
+                continue
+            self._read_size(ann)
+            merged, dropped = boxops.merge_overlaps(
+                ann.boxes, threshold=threshold, same_class_only=same_class_only,
+                width=ann.width, height=ann.height,
+            )
+            if dropped:
+                changed += 1
+                removed += dropped
+                self.set_boxes(index, merged, status=ann.status)
+
+        if removed:
+            self.save_state()
+        return {"frames": changed, "removed": removed, "scanned": len(targets)}
 
     def delete_frames(self, indices: Iterable[int]) -> int:
         removed = 0

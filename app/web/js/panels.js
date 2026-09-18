@@ -11,6 +11,32 @@ function append(parent, children) {
   for (const child of children) if (child) parent.appendChild(child);
 }
 
+/**
+ * A section that folds away. The header keeps a one-line summary so a closed
+ * section still tells you what it is set to, and the open/closed state is
+ * remembered — the panel rebuilds constantly, and sections must not spring
+ * back open every time.
+ */
+function disclosure(app, { id, title, summary = '', defaultOpen = false, children = [] }) {
+  const open = app.ui.open?.[id] ?? defaultOpen;
+  const head = el('button', {
+    class: 'disclosure-head',
+    'aria-expanded': String(open),
+    onclick: () => {
+      app.ui.open = { ...(app.ui.open || {}), [id]: !open };
+      app.renderPanel();
+    },
+  }, [
+    el('span', { class: 'disclosure-chevron', text: '›' }),
+    el('span', { class: 'disclosure-title', text: title }),
+    summary ? el('span', { class: 'disclosure-summary', text: summary }) : null,
+  ]);
+
+  const node = el('section', { class: 'disclosure', 'data-open': open ? 'true' : 'false' }, [head]);
+  if (open) node.appendChild(el('div', { class: 'disclosure-body' }, children));
+  return node;
+}
+
 function field(label, input, hint) {
   return el('label', { class: 'field' }, [
     el('span', { text: label }),
@@ -111,55 +137,63 @@ export function mediaPanel(app) {
       el('p', { class: 'block-note', text: 'Opening a dataset also loads its class names and existing boxes.' }),
     ]),
 
-    el('hr', { class: 'rule' }),
+    disclosure(app, {
+      id: 'sampling',
+      title: 'Video frames',
+      summary: app.ui.importStride > 1 ? `1 in ${app.ui.importStride}` : 'every frame',
+      children: [
+        field('Keep 1 frame in every', stride,
+          'A 30 fps clip at 5 gives you 6 frames per second — plenty for labelling, and far fewer files. Tracking needs 1.'),
+      ],
+    }),
 
-    el('div', { class: 'block' }, [
-      el('h3', {}, ['Video frames', el('small', { text: 'sampling' })]),
-      field('Keep 1 frame in every', stride,
-        'A 30 fps clip at 5 gives you 6 frames per second — plenty for labelling, and far fewer files. Tracking needs 1.'),
-    ]),
-
-    el('hr', { class: 'rule' }),
-
-    nativePicker.available ? el('div', { class: 'block' }, [
-      el('h3', {}, ['Choosing folders']),
-      (() => {
-        const box = el('input', { type: 'checkbox', ...(app.ui.nativeDialogs !== false ? { checked: 'checked' } : {}) });
-        box.addEventListener('change', () => {
-          app.ui.nativeDialogs = box.checked;
-          nativePicker.enabled = box.checked;
-          app.renderPanel();
-        });
-        return el('label', { class: 'inline-field' }, [box, 'Use the Windows file dialog']);
-      })(),
-      el('p', { class: 'block-note', text: app.ui.nativeDialogs !== false
-        ? 'Browse buttons open Explorer, the same dialog every other Windows app uses.'
-        : 'Browse buttons open the folder browser built into this page.' }),
-    ]) : null,
-    nativePicker.available ? el('hr', { class: 'rule' }) : null,
-
-    el('div', { class: 'block' }, [
-      el('h3', {}, ['This session']),
-      el('div', { class: 'stats' }, [
-        el('div', { class: 'stat' }, [el('b', { text: String(stats.frames ?? 0) }), el('span', { text: 'frames' })]),
-        el('div', { class: 'stat' }, [el('b', { text: String(stats.labelled ?? 0) }), el('span', { text: 'labelled' })]),
-        el('div', { class: 'stat' }, [el('b', { text: String(stats.boxes ?? 0) }), el('span', { text: 'objects' })]),
-      ]),
-      el('p', { class: 'block-note', text: 'Your work saves itself and comes back when you reopen ModelTrainer.' }),
-      el('button', {
-        class: 'btn danger block-btn',
-        text: 'Clear this session',
-        onclick: async () => {
-          const ok = await confirmDialog({
-            title: 'Clear everything?',
-            message: 'Every frame and label in this session is removed. Exported datasets on disk are untouched.',
-            confirmLabel: 'Clear session',
-            danger: true,
+    nativePicker.available ? disclosure(app, {
+      id: 'picker',
+      title: 'Choosing folders',
+      summary: app.ui.nativeDialogs !== false ? 'Windows dialog' : 'built-in browser',
+      children: [
+        (() => {
+          const box = el('input', { type: 'checkbox', ...(app.ui.nativeDialogs !== false ? { checked: 'checked' } : {}) });
+          box.addEventListener('change', () => {
+            app.ui.nativeDialogs = box.checked;
+            nativePicker.enabled = box.checked;
+            app.renderPanel();
           });
-          if (ok) { await api.resetSession(); toast('Session cleared.', 'ok'); }
-        },
-      }),
-    ]),
+          return el('label', { class: 'inline-field' }, [box, 'Use the Windows file dialog']);
+        })(),
+        el('p', { class: 'block-note', text: app.ui.nativeDialogs !== false
+          ? 'Browse buttons open Explorer, the same dialog every other Windows app uses.'
+          : 'Browse buttons open the folder browser built into this page.' }),
+      ],
+    }) : null,
+
+    disclosure(app, {
+      id: 'session',
+      title: 'This session',
+      summary: `${stats.frames ?? 0} frames · ${stats.boxes ?? 0} objects`,
+      defaultOpen: true,
+      children: [
+        el('div', { class: 'stats' }, [
+          el('div', { class: 'stat' }, [el('b', { text: String(stats.frames ?? 0) }), el('span', { text: 'frames' })]),
+          el('div', { class: 'stat' }, [el('b', { text: String(stats.labelled ?? 0) }), el('span', { text: 'labelled' })]),
+          el('div', { class: 'stat' }, [el('b', { text: String(stats.boxes ?? 0) }), el('span', { text: 'objects' })]),
+        ]),
+        el('p', { class: 'block-note', text: 'Your work saves itself and comes back when you reopen ModelTrainer.' }),
+        el('button', {
+          class: 'btn danger block-btn',
+          text: 'Clear this session',
+          onclick: async () => {
+            const ok = await confirmDialog({
+              title: 'Clear everything?',
+              message: 'Every frame and label in this session is removed. Exported datasets on disk are untouched.',
+              confirmLabel: 'Clear session',
+              danger: true,
+            });
+            if (ok) { await api.resetSession(); toast('Session cleared.', 'ok'); }
+          },
+        }),
+      ],
+    }),
   ]);
 }
 
@@ -204,11 +238,16 @@ export function labelPanel(app) {
       el('span', { text: name }),
     ])));
 
-  const classBlock = el('div', { class: 'block' }, [
-    el('h3', {}, ['Classes', el('small', { text: `${app.state.classes.length} defined` })]),
-    classTags,
-    el('button', { class: 'btn block-btn', text: 'Edit classes', onclick: () => editClasses(app) }),
-  ]);
+  const classBlock = disclosure(app, {
+    id: 'classes',
+    title: 'Classes',
+    summary: app.state.classes.length === 1 ? app.state.classes[0] : `${app.state.classes.length} defined`,
+    defaultOpen: true,
+    children: [
+      classTags,
+      el('button', { class: 'btn block-btn', text: 'Edit classes', onclick: () => editClasses(app) }),
+    ],
+  });
 
   // ── Shared auto-label settings ──
   const samModel = select(app.state.samModels, app.state.samModel);
@@ -228,18 +267,23 @@ export function labelPanel(app) {
   ], app.ui.policy);
   policy.addEventListener('change', () => { app.ui.policy = policy.value; app.renderPanel(); });
 
-  const settingsBlock = el('div', { class: 'block' }, [
-    el('h3', {}, ['Auto-label settings']),
-    field('Model', samModel),
-    field('Confidence', threshold, null),
-    thresholdOut,
-    field('If a frame already has labels', policy,
-      app.ui.policy === 'replace'
-        ? 'Careful: boxes you drew by hand on those frames are overwritten.'
-        : app.ui.policy === 'skip'
-          ? 'Frames you have already labelled are skipped entirely.'
-          : 'New findings are added next to what is already there.'),
-  ]);
+  const policyWord = { replace: 'replace', merge: 'add to', skip: 'skip' }[app.ui.policy] || app.ui.policy;
+  const settingsBlock = disclosure(app, {
+    id: 'autolabel-settings',
+    title: 'Auto-label settings',
+    summary: `${app.state.samModel.split(' (')[0]} · ${Math.round(app.state.threshold * 100)}% · ${policyWord}`,
+    children: [
+      field('Model', samModel),
+      field('Confidence', threshold, null),
+      thresholdOut,
+      field('If a frame already has labels', policy,
+        app.ui.policy === 'replace'
+          ? 'Careful: boxes you drew by hand on those frames are overwritten.'
+          : app.ui.policy === 'skip'
+            ? 'Frames you have already labelled are skipped entirely.'
+            : 'New findings are added next to what is already there.'),
+    ],
+  });
 
   // ── Methods ──
   const methods = el('div', { class: 'methods' },
@@ -247,15 +291,91 @@ export function labelPanel(app) {
 
   return el('div', { class: 'panel-inner' }, [
     classBlock,
-    el('hr', { class: 'rule' }),
     el('div', { class: 'block' }, [
       el('h3', {}, ['Label automatically']),
       el('p', { class: 'block-note', text: 'Pick one way to work. Each one runs on its own and can be stopped at any time.' }),
       methods,
     ]),
-    el('hr', { class: 'rule' }),
     settingsBlock,
+    tidyBlock(app, boxCount),
   ]);
+}
+
+// Auto-labelling often stacks several boxes on one object. This folds them back
+// into one without having to click through every frame by hand.
+function tidyBlock(app, boxCount) {
+  const ui = app.ui;
+
+  const threshold = el('input', {
+    type: 'range', min: '0.3', max: '1', step: '0.05', value: String(ui.mergeThreshold),
+  });
+  const readout = el('p', { class: 'block-note', text: overlapLabel(ui.mergeThreshold) });
+  threshold.addEventListener('input', () => { readout.textContent = overlapLabel(+threshold.value); });
+  threshold.addEventListener('change', () => { ui.mergeThreshold = +threshold.value; });
+
+  const sameClass = el('input', {
+    type: 'checkbox', ...(ui.mergeSameClass !== false ? { checked: 'checked' } : {}),
+  });
+  sameClass.addEventListener('change', () => { ui.mergeSameClass = sameClass.checked; });
+
+  const run = async (scope) => {
+    const payload = {
+      scope,
+      frame: app.currentIndex,
+      threshold: +threshold.value,
+      sameClassOnly: sameClass.checked,
+    };
+    if (scope === 'all') {
+      const ok = await confirmDialog({
+        title: 'Merge across every frame?',
+        message: `Any boxes overlapping by ${Math.round(+threshold.value * 100)}% or more become one box, on all ${app.state.frames.length} frames. Undo only covers the frame you are looking at, so this is worth exporting before.`,
+        confirmLabel: 'Merge them',
+      });
+      if (!ok) return;
+    }
+    try {
+      const res = await api.mergeOverlaps(payload);
+      app.state.stats = res.stats;
+      await app.reloadFrame();
+      toast(res.removed
+        ? `${plural(res.removed, 'box', 'boxes')} folded away across ${plural(res.frames, 'frame')}.`
+        : 'Nothing overlapped that much — try a lower percentage.',
+        res.removed ? 'ok' : 'warn', 'Merge overlapping');
+    } catch (err) {
+      toast(err.message, 'error', 'Could not merge');
+    }
+  };
+
+  return disclosure(app, {
+    id: 'tidy',
+    title: 'Tidy up boxes',
+    summary: `${Math.round(ui.mergeThreshold * 100)}% overlap`,
+    children: [
+      el('p', { class: 'block-note', text: 'Select boxes on the image and press M to merge them by hand, or fold overlapping duplicates together here.' }),
+      field('Merge when they overlap by', threshold),
+      readout,
+      el('label', { class: 'inline-field' }, [sameClass, 'Only merge boxes of the same class']),
+      el('button', {
+        class: 'btn block-btn',
+        text: 'Merge on this frame',
+        disabled: boxCount > 1 ? null : 'disabled',
+        onclick: () => run('frame'),
+      }),
+      el('button', {
+        class: 'btn block-btn',
+        text: `Merge across all ${app.state.frames.length} frames`,
+        disabled: app.state.frames.length ? null : 'disabled',
+        onclick: () => run('all'),
+      }),
+    ],
+  });
+}
+
+function overlapLabel(value) {
+  const pct = Math.round(value * 100);
+  if (value >= 0.95) return `${pct}% — only boxes sitting almost exactly on top of each other`;
+  if (value <= 0.5) return `${pct}% — merges freely, and will join neighbours that only touch`;
+  return `${pct}% — when this much of the smaller box is inside the bigger one`;
 }
 
 function confidenceLabel(value) {
@@ -514,8 +634,11 @@ export function trainPanel(app) {
   ]);
 
   // Convert
-  const convertBlock = el('div', { class: 'block' }, [
-    el('h3', {}, ['Convert a dataset', el('small', { text: 'on disk' })]),
+  const convertBlock = disclosure(app, {
+    id: 'convert',
+    title: 'Convert a dataset',
+    summary: 'on disk',
+    children: [
     el('p', { class: 'block-note', text: 'Upgrades an exported dataset in place, writing a new folder next to it.' }),
     el('button', {
       class: 'btn block-btn',
@@ -531,7 +654,8 @@ export function trainPanel(app) {
       text: 'Masks → 4 corner points (pose)',
       onclick: () => convertPoseDialog(),
     }),
-  ]);
+    ],
+  });
 
   // Train
   const models = app.models?.[app.state.task] || [];
@@ -596,8 +720,11 @@ export function trainPanel(app) {
   const shape = select([['dynamic', 'Dynamic — any input size'], ['static', 'Static — fixed input size']], ui.shape);
   shape.addEventListener('change', () => { ui.shape = shape.value; });
 
-  const onnxBlock = el('div', { class: 'block' }, [
-    el('h3', {}, ['Export to ONNX']),
+  const onnxBlock = disclosure(app, {
+    id: 'onnx',
+    title: 'Export to ONNX',
+    summary: `${ui.precision} · ${ui.shape}`,
+    children: [
     el('div', { class: 'field-row' }, [field('Precision', prec), field('Input shape', shape)]),
     el('button', {
       class: 'btn block-btn',
@@ -616,12 +743,14 @@ export function trainPanel(app) {
       },
     }),
     el('p', { class: 'block-note', text: 'Exports at the image size set above. FP16 needs a CUDA GPU, and an export runs to completion once started.' }),
-  ]);
+    ],
+  });
 
   return el('div', { class: 'panel-inner' }, [
-    exportBlock, el('hr', { class: 'rule' }),
-    trainBlock, el('hr', { class: 'rule' }),
-    convertBlock, el('hr', { class: 'rule' }),
+    exportBlock,
+    el('hr', { class: 'rule' }),
+    trainBlock,
+    convertBlock,
     onnxBlock,
   ]);
 }

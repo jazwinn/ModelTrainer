@@ -33,7 +33,10 @@ export const api = {
   putBoxes:     (i, boxes, status) => request('PUT', `/api/frames/${i}/boxes`, { boxes, status }),
   putStatus:    (i, status)   => request('PUT', `/api/frames/${i}/status`, { status }),
   deleteFrame:  (i)           => request('DELETE', `/api/frames/${i}`),
+  deleteFrames: (indices)     => request('POST', '/api/frames/delete', { indices }),
   clearLabels:  (indices)     => request('POST', '/api/frames/clear-labels', { indices }),
+  mergeBoxes:   (i, indices)  => request('POST', `/api/frames/${i}/merge`, { indices }),
+  mergeOverlaps:(payload)     => request('POST', '/api/labels/merge-overlaps', payload),
 
   describe:     (payload)     => request('POST', '/api/autolabel/describe', payload),
   propagate:    (payload)     => request('POST', '/api/autolabel/propagate', payload),

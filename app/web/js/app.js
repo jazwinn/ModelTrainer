@@ -4,7 +4,7 @@
 import { api, connect } from './api.js';
 import { Editor } from './canvas.js';
 import { labelPanel, mediaPanel, trainPanel } from './panels.js';
-import { confirmDialog, el, nativePicker, plural, toast } from './ui.js';
+import { confirmDialog, el, nativePicker, openModal, closeModal, plural, toast } from './ui.js';
 
 const UI_DEFAULTS = {
   importStride: 1,
@@ -27,6 +27,9 @@ const UI_DEFAULTS = {
   skipUnreviewed: false,
   filter: 'all',
   nativeDialogs: true,
+  mergeThreshold: 0.8,
+  mergeSameClass: true,
+  open: {},
 };
 
 const app = {
@@ -35,6 +38,9 @@ const app = {
   ui: loadUi(),
   step: 'media',
   currentIndex: null,
+  // Frames picked in the filmstrip. Always holds currentIndex; Clear labels and
+  // Drop frames act on all of it.
+  frameSelection: new Set(),
   frameDetail: null,
   examples: { positive: [], negative: [] },
   jobs: new Map(),
@@ -72,6 +78,11 @@ const dom = {
   frameLabel: document.getElementById('frameLabel'),
   boxSummary: document.getElementById('boxSummary'),
   saveState: document.getElementById('saveState'),
+  selectionInfo: document.getElementById('selectionInfo'),
+  mergeBtn: document.getElementById('mergeBtn'),
+  clearFrameBtn: document.getElementById('clearFrameBtn'),
+  dropFrameBtn: document.getElementById('dropFrameBtn'),
+  stripSelection: document.getElementById('stripSelection'),
   jobbar: document.getElementById('jobbar'),
   device: document.getElementById('deviceInfo'),
   frameCount: document.getElementById('frameCount'),
@@ -92,8 +103,12 @@ app.goStep = (step) => {
 
 app.renderPanel = () => {
   const builder = { media: mediaPanel, label: labelPanel, train: trainPanel }[app.step];
+  // The panel is rebuilt on almost every event, so hold the scroll position —
+  // otherwise it jumps to the top while you are working in a section.
+  const scroll = dom.panel.scrollTop;
   dom.panel.innerHTML = '';
   dom.panel.appendChild(builder(app));
+  dom.panel.scrollTop = scroll;
   saveUi();
 };
 
@@ -119,6 +134,8 @@ app.setSearchClass = (id) => {
   dom.activeClass.value = String(id);
   app.editor.classId = id;
 };
+
+app.reloadFrame = () => reloadCurrentFrame();
 
 app.clearExamples = () => {
   app.editor.clearExamples();
@@ -176,8 +193,8 @@ function makeThumb(frame) {
   const img = el('img', { loading: 'lazy', alt: `Frame ${frame.index}`, src: `/api/frames/${frame.index}/thumb` });
   const node = el('div', {
     class: 'thumb', 'data-index': String(frame.index), role: 'option', tabindex: '0',
-    onclick: () => selectFrame(frame.index),
-    onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectFrame(frame.index); } },
+    onclick: (e) => pickFrame(frame.index, e),
+    onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pickFrame(frame.index, e); } },
   }, [img, el('span', { class: 'thumb-idx', text: String(frame.index) }), el('span', { class: 'thumb-n' })]);
   updateThumb(node, frame);
   return node;
@@ -185,17 +202,83 @@ function makeThumb(frame) {
 
 function updateThumb(node, frame) {
   node.setAttribute('aria-selected', frame.index === app.currentIndex ? 'true' : 'false');
+  const multi = app.frameSelection.size > 1;
+  node.setAttribute('data-picked', multi && app.frameSelection.has(frame.index) ? 'true' : 'false');
   const badge = node.querySelector('.thumb-n');
   badge.textContent = frame.boxes ? String(frame.boxes) : '';
   badge.className = `thumb-n ${frame.status}`;
 }
 
+/** Filmstrip click: plain picks one, Shift takes a range, Ctrl adds or removes. */
+function pickFrame(index, event) {
+  const frames = visibleFrames().map((f) => f.index);
+  if (event?.shiftKey && app.currentIndex !== null) {
+    const from = frames.indexOf(app.currentIndex);
+    const to = frames.indexOf(index);
+    if (from >= 0 && to >= 0) {
+      const [lo, hi] = from < to ? [from, to] : [to, from];
+      app.frameSelection = new Set(frames.slice(lo, hi + 1));
+    }
+  } else if (event?.ctrlKey || event?.metaKey) {
+    if (app.frameSelection.has(index) && app.frameSelection.size > 1) {
+      app.frameSelection.delete(index);
+      if (index === app.currentIndex) {
+        selectFrame([...app.frameSelection][0], { keepSelection: true });
+        return;
+      }
+      renderStrip();
+      updateFrameActions();
+      return;
+    }
+    app.frameSelection.add(index);
+  } else {
+    app.frameSelection = new Set([index]);
+  }
+  selectFrame(index, { keepSelection: true });
+}
+
+function selectedFrames() {
+  return [...app.frameSelection].sort((a, b) => a - b);
+}
+
+/** Keep the buttons honest about how many frames they are about to change. */
+function updateFrameActions() {
+  const count = app.frameSelection.size;
+  const many = count > 1;
+  dom.clearFrameBtn.textContent = many ? `Clear ${count} frames` : 'Clear frame';
+  dom.dropFrameBtn.textContent = many ? `Drop ${count} frames` : 'Drop frame';
+  dom.clearFrameBtn.title = many
+    ? `Remove every box on the ${count} selected frames`
+    : 'Remove every box on this frame';
+  dom.dropFrameBtn.title = many
+    ? `Drop the ${count} selected frames from the session`
+    : 'Drop this frame from the session';
+
+  dom.stripSelection.hidden = !many;
+  dom.stripSelection.innerHTML = '';
+  if (many) {
+    dom.stripSelection.append(
+      el('span', { text: `${count} selected` }),
+      el('button', {
+        class: 'linky', text: 'clear', title: 'Go back to a single frame',
+        onclick: () => {
+          app.frameSelection = new Set(app.currentIndex === null ? [] : [app.currentIndex]);
+          renderStrip();
+          updateFrameActions();
+        },
+      }),
+    );
+  }
+}
+
 // ── Frame selection ────────────────────────────────────────────
 
-async function selectFrame(index, { scroll = false } = {}) {
+async function selectFrame(index, { scroll = false, keepSelection = false } = {}) {
   if (index === null || index === undefined) return;
   await flushSave();
   app.currentIndex = index;
+  if (!keepSelection) app.frameSelection = new Set([index]);
+  else app.frameSelection.add(index);
 
   let detail;
   try {
@@ -211,8 +294,13 @@ async function selectFrame(index, { scroll = false } = {}) {
   dom.frameLabel.textContent = `Frame ${index}`;
   updateBoxSummary();
   updateReviewButton();
+  updateSelectionInfo();
+  updateFrameActions();
   for (const node of dom.strip.children) {
-    node.setAttribute('aria-selected', Number(node.dataset.index) === index ? 'true' : 'false');
+    const at = Number(node.dataset.index);
+    node.setAttribute('aria-selected', at === index ? 'true' : 'false');
+    node.setAttribute('data-picked',
+      app.frameSelection.size > 1 && app.frameSelection.has(at) ? 'true' : 'false');
   }
   if (scroll) {
     const node = dom.strip.querySelector(`[data-index="${index}"]`);
@@ -233,6 +321,37 @@ function updateReviewButton() {
     : 'Mark this frame as checked by you — export can then skip the rest.';
 }
 
+function updateSelectionInfo() {
+  const count = app.editor?.selection.length || 0;
+  dom.selectionInfo.hidden = count === 0;
+  dom.selectionInfo.textContent = count === 1
+    ? '1 box selected'
+    : `${count} boxes selected — press M to merge`;
+  dom.mergeBtn.disabled = count < 2;
+}
+
+/** Replace the selected boxes with one that covers them all. */
+async function mergeSelected() {
+  const indices = app.editor.selectionIndices();
+  if (indices.length < 2) {
+    toast('Select two or more boxes first — Shift-click them, or drag a lasso around them.', 'warn');
+    return;
+  }
+  app.editor.pushUndo();
+  await flushSave();
+  try {
+    const res = await api.mergeBoxes(app.currentIndex, indices);
+    app.editor.setBoxes(res.boxes);
+    app.state.stats = res.stats;
+    updateBoxSummary();
+    updateSelectionInfo();
+    scheduleStrip();
+    toast(`${indices.length} boxes merged into one.`, 'ok');
+  } catch (err) {
+    toast(err.message, 'error', 'Could not merge');
+  }
+}
+
 function updateBoxSummary() {
   const boxes = app.editor?.boxes || [];
   const detail = app.frameDetail;
@@ -243,12 +362,94 @@ function updateBoxSummary() {
   dom.boxSummary.textContent = parts.join('  ·  ');
 }
 
-function step(delta) {
+function step(delta, extend = false) {
   const frames = visibleFrames();
   if (!frames.length) return;
   const at = frames.findIndex((f) => f.index === app.currentIndex);
   const next = frames[Math.min(frames.length - 1, Math.max(0, (at < 0 ? 0 : at) + delta))];
-  if (next) selectFrame(next.index, { scroll: true });
+  if (!next) return;
+  if (extend) app.frameSelection.add(next.index);
+  selectFrame(next.index, { scroll: true, keepSelection: extend });
+}
+
+/** Strip the labels off every selected frame. */
+async function clearSelectedFrames() {
+  const frames = selectedFrames();
+  if (!frames.length) return;
+
+  if (frames.length === 1) {
+    app.editor.clearAll();   // one frame stays undoable in the editor
+    return;
+  }
+  const carrying = frames.filter((i) => (app.state.frames.find((f) => f.index === i)?.boxes || 0) > 0);
+  if (!carrying.length) {
+    toast('Those frames have no labels to clear.', 'warn');
+    return;
+  }
+  const ok = await confirmDialog({
+    title: `Clear labels on ${plural(frames.length, 'frame')}?`,
+    message: `${plural(carrying.length, 'frame')} carry labels. The frames stay; their boxes are removed. This cannot be undone.`,
+    confirmLabel: 'Clear them',
+    danger: true,
+  });
+  if (!ok) return;
+
+  await flushSave();
+  try {
+    const res = await api.clearLabels(frames);
+    app.state.stats = res.stats;
+    await refreshStats();
+    await reloadCurrentFrame();
+    toast(`Labels cleared on ${plural(frames.length, 'frame')}.`, 'ok');
+  } catch (err) {
+    toast(err.message, 'error', 'Could not clear');
+  }
+}
+
+/** Remove every selected frame from the session. */
+async function dropSelectedFrames() {
+  const frames = selectedFrames();
+  if (!frames.length) return;
+
+  const ok = await confirmDialog({
+    title: frames.length === 1 ? `Drop frame ${frames[0]}?` : `Drop ${plural(frames.length, 'frame')}?`,
+    message: frames.length === 1
+      ? 'The frame and its labels leave this session. The original file on disk is untouched.'
+      : `Those ${frames.length} frames and their labels leave this session. The original files on disk are untouched.`,
+    confirmLabel: frames.length === 1 ? 'Drop it' : 'Drop them',
+    danger: true,
+  });
+  if (!ok) return;
+
+  // Pick what to show afterwards: the first frame below the ones going away.
+  const visible = visibleFrames().map((f) => f.index);
+  const doomed = new Set(frames);
+  const after = visible.find((i) => i > Math.max(...frames) && !doomed.has(i));
+  const before = [...visible].reverse().find((i) => i < Math.min(...frames) && !doomed.has(i));
+  const next = after ?? before ?? null;
+
+  try {
+    await api.deleteFrames(frames);
+  } catch (err) {
+    toast(err.message, 'error', 'Could not drop');
+    return;
+  }
+  app.state.frames = app.state.frames.filter((f) => !doomed.has(f.index));
+  app.frameSelection = new Set();
+  app.currentIndex = null;
+  renderStrip();
+
+  if (next !== null) {
+    selectFrame(next, { scroll: true });
+  } else {
+    app.frameDetail = null;
+    app.editor.load(null, []);
+    dom.stageEmpty.hidden = false;
+    dom.frameLabel.textContent = '—';
+    updateFrameActions();
+    app.renderPanel();
+  }
+  toast(`${plural(frames.length, 'frame')} dropped.`, 'ok');
 }
 
 // ── Saving ─────────────────────────────────────────────────────
@@ -311,6 +512,67 @@ function renderHud() {
   for (const note of notes) {
     dom.stageHud.appendChild(el('div', { class: `hud-note ${note.kind}`, html: note.html }));
   }
+}
+
+// ── Keyboard reference ─────────────────────────────────────────
+
+const SHORTCUTS = [
+  ['Tools', [
+    ['V', 'Select and edit boxes'],
+    ['B', 'Draw a box'],
+    ['E', 'Mark an example for SAM 3 to match'],
+    ['X', 'Mark something to exclude'],
+  ]],
+  ['Selecting', [
+    ['Click', 'Select one box'],
+    ['Shift-click', 'Add a box to the selection, or take it out'],
+    ['Drag on empty space', 'Lasso every box the rectangle touches'],
+    ['Ctrl+A', 'Select every box on this frame'],
+    ['Esc', 'Select nothing'],
+  ]],
+  ['Editing', [
+    ['M', 'Merge the selected boxes into one'],
+    ['Delete', 'Remove the selected boxes'],
+    ['0 – 9', 'Put the selected boxes in that class'],
+    ['Drag a box', 'Move it — moves the whole selection'],
+    ['Drag a corner', 'Resize (one box at a time)'],
+    ['Right-click a box', 'Delete it'],
+    ['Right-click a keypoint', 'Remove it, or bring a removed one back'],
+    ['Ctrl+Z', 'Undo on this frame'],
+  ]],
+  ['Frames', [
+    ['Click a frame', 'Open it'],
+    ['Shift-click a frame', 'Select everything between it and the current one'],
+    ['Ctrl-click a frame', 'Add it to the selection, or take it out'],
+    ['Shift + ← →', 'Extend the selection frame by frame'],
+    ['Clear frames · Drop frames', 'Act on every selected frame'],
+  ]],
+  ['Getting around', [
+    ['← →', 'Previous / next frame'],
+    ['Wheel', 'Zoom'],
+    ['Space-drag · middle-drag · Alt-drag', 'Pan'],
+    ['F', 'Fit the image to the window'],
+    ['Ctrl+S', 'Save the session now'],
+    ['?', 'Show this list'],
+  ]],
+];
+
+function showShortcuts() {
+  const body = el('div', { class: 'shortcuts' },
+    SHORTCUTS.map(([group, rows]) => el('div', { class: 'shortcut-group' }, [
+      el('h4', { text: group }),
+      ...rows.map(([keys, what]) => el('div', { class: 'shortcut' }, [
+        el('span', { class: 'shortcut-keys' },
+          keys.split(' · ').map((k) => el('kbd', { text: k }))),
+        el('span', { text: what }),
+      ])),
+    ])));
+  openModal({
+    title: 'Keyboard shortcuts',
+    subtitle: 'Keys work whenever the canvas has focus and you are not typing in a field.',
+    body,
+    actions: [{ label: 'Close', kind: 'primary', onClick: () => closeModal() }],
+  });
 }
 
 // ── Job bar ────────────────────────────────────────────────────
@@ -566,7 +828,9 @@ function bind() {
   document.getElementById('zoomOut').onclick = () => app.editor.zoomBy(1 / 1.25);
   document.getElementById('zoomFit').onclick = () => app.editor.fit();
   document.getElementById('undoBtn').onclick = () => { if (!app.editor.undo()) toast('Nothing left to undo on this frame.', 'warn'); };
-  document.getElementById('clearFrameBtn').onclick = () => app.editor.clearAll();
+  dom.clearFrameBtn.onclick = () => clearSelectedFrames();
+  dom.mergeBtn.onclick = () => mergeSelected();
+  document.getElementById('helpBtn').onclick = () => showShortcuts();
   document.getElementById('reviewBtn').onclick = async () => {
     if (app.currentIndex === null) return;
     const reviewed = app.frameDetail?.status === 'verified' || app.frameDetail?.status === 'exported';
@@ -576,32 +840,7 @@ function bind() {
     updateReviewButton();
     scheduleStrip();
   };
-  document.getElementById('dropFrameBtn').onclick = async () => {
-    if (app.currentIndex === null) return;
-    const index = app.currentIndex;
-    const ok = await confirmDialog({
-      title: `Drop frame ${index}?`,
-      message: 'The frame and its labels leave this session. The original file on disk is untouched.',
-      confirmLabel: 'Drop it',
-      danger: true,
-    });
-    if (!ok) return;
-    const frames = visibleFrames();
-    const at = frames.findIndex((f) => f.index === index);
-    await api.deleteFrame(index);
-    app.state.frames = app.state.frames.filter((f) => f.index !== index);
-    const next = frames[at + 1] || frames[at - 1];
-    app.currentIndex = null;
-    renderStrip();
-    if (next) selectFrame(next.index, { scroll: true });
-    else {
-      app.frameDetail = null;
-      app.editor.load(null, []);
-      dom.stageEmpty.hidden = false;
-      dom.frameLabel.textContent = '—';
-      app.renderPanel();
-    }
-  };
+  dom.dropFrameBtn.onclick = () => dropSelectedFrames();
 
   document.addEventListener('keydown', (e) => {
     const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName);
@@ -617,15 +856,27 @@ function bind() {
       flushSave().then(() => api.saveSession()).then(() => toast('Session saved.', 'ok'));
       return;
     }
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') {
+      e.preventDefault();
+      app.editor.selectAll();
+      return;
+    }
     switch (e.key) {
-      case 'ArrowLeft': case 'ArrowUp': e.preventDefault(); step(-1); break;
-      case 'ArrowRight': case 'ArrowDown': e.preventDefault(); step(1); break;
+      case 'ArrowLeft': case 'ArrowUp': e.preventDefault(); step(-1, e.shiftKey); break;
+      case 'ArrowRight': case 'ArrowDown': e.preventDefault(); step(1, e.shiftKey); break;
       case 'Delete': case 'Backspace': app.editor.deleteSelected(); break;
       case 'v': case 'V': setTool('select'); break;
       case 'b': case 'B': setTool('draw'); break;
       case 'e': case 'E': setTool('pos'); break;
       case 'x': case 'X': setTool('neg'); break;
       case 'f': case 'F': app.editor.fit(); break;
+      case 'm': case 'M': mergeSelected(); break;
+      case 'Escape': app.editor.select(null); break;
+      case '?': showShortcuts(); break;
+      case ' ':
+        e.preventDefault();
+        app.editor.setSpaceHeld(true);
+        break;
       default:
         if (/^[0-9]$/.test(e.key)) {
           const id = e.key === '0' ? 9 : Number(e.key) - 1;
@@ -633,6 +884,11 @@ function bind() {
         }
     }
   });
+
+  document.addEventListener('keyup', (e) => {
+    if (e.key === ' ') app.editor.setSpaceHeld(false);
+  });
+  window.addEventListener('blur', () => app.editor?.setSpaceHeld(false));
 
   window.addEventListener('beforeunload', () => { flushSave(); saveUi(); });
 }
@@ -642,12 +898,15 @@ function bind() {
 async function main() {
   app.editor = new Editor(dom.canvas, dom.host);
   app.editor.onChange = (boxes) => { queueSave(boxes); updateBoxSummary(); scheduleStrip(); };
-  app.editor.onSelect = (box) => {
-    if (box) {
-      dom.activeClass.value = String(box.class_id);
-      app.ui.classId = box.class_id;
-      app.editor.classId = box.class_id;
+  app.editor.onSelect = (selection) => {
+    const boxes = selection || [];
+    const primary = boxes[0];
+    if (primary) {
+      dom.activeClass.value = String(primary.class_id);
+      app.ui.classId = primary.class_id;
+      app.editor.classId = primary.class_id;
     }
+    updateSelectionInfo();
   };
   app.editor.onExemplars = (positive, negative) => {
     app.examples = {

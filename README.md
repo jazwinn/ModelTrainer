@@ -61,7 +61,8 @@ step, or for one pick with the button on the waiting window.
 
 The centre pane is the editor; the right panel holds one **Auto-label** section with four
 named methods. Only one is open at a time, each says what it does and when to use it, and
-each has a single button that starts it.
+each has a single button that starts it. Settings and cleanup tools fold away around them,
+and a folded section still shows what it is set to.
 
 | Method | What it does | Reach for it when |
 |--------|--------------|-------------------|
@@ -79,24 +80,59 @@ Three settings sit under the methods and apply to all of them:
 
 #### Editing by hand
 
-| Control | |
-|---------|--|
-| **Select** (`V`) | Click a box to select, drag to move, drag a handle to resize |
-| **Draw box** (`B`) | Drag on the image to add a box in the active class |
-| **Example** (`E`) / **Exclude** (`X`) | Green and red example boxes for *Point at an example* |
-| `←` `→` | Previous / next frame |
-| `Delete` | Remove the selected box |
-| `0`–`9` | Switch the active class (also changes the selected box) |
+Press `?` in the app for this list at any time; the tool buttons carry their key too.
+
+| Keys | |
+|------|--|
+| `V` `B` `E` `X` | Select · Draw box · Example · Exclude |
+| Click · `Shift`-click | Select a box · add it to the selection, or take it out |
+| Drag on empty space | Lasso every box the rectangle touches |
+| `Ctrl+A` · `Esc` | Select every box on the frame · select nothing |
+| `M` | **Merge the selected boxes into one** |
+| `Delete` | Remove the selected boxes |
+| `0`–`9` | Put the selected boxes in that class |
 | `Ctrl+Z` | Undo on the current frame |
-| `F` | Fit the image to the window |
-| Wheel / `Shift`-drag | Zoom / pan |
-| `Ctrl+S` | Save the session now (it also saves itself) |
+| `←` `→` · `Shift`+`←` `→` | Previous / next frame · extend the frame selection |
+| Wheel · `Space`-drag, middle-drag or `Alt`-drag | Zoom · pan |
+| `F` · `Ctrl+S` | Fit the image to the window · save the session now |
+
+Dragging a box moves the whole selection, so several boxes can be nudged at once.
+Resize handles appear only when a single box is selected.
+
+#### Working on several frames
+
+The filmstrip selects like a file list: click opens a frame, `Shift`-click takes
+everything between it and the current one, `Ctrl`-click adds or removes one, and
+`Shift`+arrow extends the run. Selected frames are tinted blue, and the frame you are
+looking at carries a bright border, an edge bar and a highlighted number.
+
+**Clear frames** and **Drop frames** then act on the whole selection and say how many they
+will touch. Clearing a single frame stays undoable in the editor; clearing several asks
+first, because it cannot be undone. Dropping frames removes them from the session only —
+the original files on disk are untouched.
 
 Boxes are coloured by class. A **dashed** outline means SAM suggested it and nobody has
 looked yet; a **solid** one means a human drew or adjusted it. Pose keypoints show as
 numbered corner dots — drag to move, right-click to remove, right-click a ghost to bring
 it back. **Mark reviewed** records that you have checked a frame, which the exporter can
 then filter on.
+
+#### Merging boxes
+
+Auto-labelling often leaves two or three boxes stacked on the same object, and one
+object sometimes comes back as several pieces. Both have a fix:
+
+* **By hand** — select the boxes (lasso them, or `Shift`-click) and press `M`. The
+  result covers all of them, takes the class most of them agreed on, and counts as
+  hand-made. `Ctrl+Z` puts them back.
+* **In bulk** — **Tidy up boxes** in the Label panel folds overlapping boxes together
+  on this frame or across every frame. Two boxes join when the chosen percentage of
+  the smaller one sits inside the bigger one, and joining is transitive, so a pile of
+  duplicates collapses in one pass. Boxes of different classes are left alone unless
+  you say otherwise.
+
+When merged boxes carry masks, the new outline is the convex hull of the originals, so
+nothing is clipped. Pose keypoints become the four corners of the merged box.
 
 ### 3 · Train
 
@@ -139,6 +175,7 @@ app/
   core/              Qt-free engine
     session.py         the session: frames, classes, models, jobs
     jobs.py            background jobs with progress and cancellation
+    boxops.py          merging boxes, by hand and by overlap
     media_loader.py    images and video → frames
     sam3_handler.py    SAM 3 concept segmentation and video tracking
     yolo_trainer.py    Ultralytics training (stoppable mid-run)

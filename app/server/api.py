@@ -393,6 +393,47 @@ async def delete_frame(index: int) -> dict:
     return {"removed": removed, "stats": session.stats()}
 
 
+@app.post("/api/frames/delete")
+async def delete_frames(payload: dict = Body(...)) -> dict:
+    """Drop several frames at once — what the filmstrip selection acts on."""
+    indices = [int(i) for i in payload.get("indices", [])]
+    if not indices:
+        raise HTTPException(400, "No frames given.")
+    removed = session.delete_frames(indices)
+    return {"removed": removed, "stats": session.stats()}
+
+
+@app.post("/api/frames/{index}/merge")
+async def merge_boxes(index: int, payload: dict = Body(...)) -> dict:
+    """Merge the chosen boxes on this frame into one that covers them all."""
+    try:
+        merged = session.merge_boxes_on_frame(index, [int(i) for i in payload.get("indices", [])])
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"boxes": [b.to_dict() for b in merged], "stats": session.stats()}
+
+
+@app.post("/api/labels/merge-overlaps")
+async def merge_overlaps(payload: dict = Body(...)) -> dict:
+    """Fold overlapping duplicates together on one frame or across the session."""
+    threshold = max(0.1, min(1.0, float(payload.get("threshold", 0.8))))
+    same_class_only = bool(payload.get("sameClassOnly", True))
+
+    frames = None
+    if payload.get("scope") == "frame":
+        index = payload.get("frame")
+        if index is None or session.get(int(index)) is None:
+            raise HTTPException(400, "That frame is not loaded.")
+        frames = [int(index)]
+
+    result = await run_in_threadpool(
+        session.merge_overlapping, frames,
+        threshold=threshold, same_class_only=same_class_only,
+    )
+    result["stats"] = session.stats()
+    return result
+
+
 @app.post("/api/frames/clear-labels")
 async def clear_labels(payload: dict = Body(...)) -> dict:
     indices = payload.get("indices")

@@ -25,16 +25,33 @@ def _print_torch_info() -> None:
         print("No CUDA-compatible GPU detected by PyTorch.")
 
 
-def _free_port(host: str, preferred: int) -> int:
+def _port_is_free(host: str, port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         try:
-            sock.bind((host, preferred))
-            return preferred
+            sock.bind((host, port))
+            return True
         except OSError:
-            pass
+            return False
+
+
+def _any_free_port(host: str) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind((host, 0))
         return sock.getsockname()[1]
+
+
+def _modeltrainer_at(host: str, port: int) -> bool:
+    """True when the thing already holding this port is a ModelTrainer server."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/api/state", timeout=1.5) as response:
+            data = json.load(response)
+        return isinstance(data, dict) and "frames" in data and "classes" in data
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
 
 
 def main() -> None:
@@ -50,9 +67,25 @@ def main() -> None:
 
     from app.server.api import app
 
-    port = _free_port(args.host, args.port)
-    url = f"http://{'localhost' if args.host in ('127.0.0.1', '0.0.0.0') else args.host}:{port}"
+    def address(at: int) -> str:
+        shown = "localhost" if args.host in ("127.0.0.1", "0.0.0.0") else args.host
+        return f"http://{shown}:{at}"
 
+    port = args.port
+    if not _port_is_free(args.host, port):
+        # Quietly starting a second server on another port would give it its own
+        # view of the same session folder, and the two would overwrite each other.
+        if _modeltrainer_at(args.host, port):
+            running = address(port)
+            print(f"\nModelTrainer is already running at {running} — opening that one.")
+            print("Close it first if you meant to start a fresh server.\n")
+            if not args.no_browser:
+                webbrowser.open(running)
+            return
+        port = _any_free_port(args.host)
+        print(f"\nPort {args.port} is taken by something else — using {port} instead.")
+
+    url = address(port)
     print(f"\nModelTrainer is running at {url}\nPress Ctrl+C to stop.\n")
     if not args.no_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()

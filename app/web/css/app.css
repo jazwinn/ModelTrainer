@@ -161,6 +161,20 @@ button, select, input, textarea { font:inherit; color:inherit; }
 }
 .filmstrip-count { font-size:11px; color:var(--text-faint); }
 
+.strip-selection {
+  display:flex; align-items:center; gap:6px;
+  font-size:11px;
+  color:var(--accent);
+}
+.linky {
+  background:none; border:none; padding:0;
+  color:var(--text-dim);
+  font-size:11px;
+  text-decoration:underline;
+  cursor:pointer;
+}
+.linky:hover { color:var(--text); }
+
 .strip {
   flex:1;
   overflow-y:auto;
@@ -172,7 +186,8 @@ button, select, input, textarea { font:inherit; color:inherit; }
 
 .thumb {
   position:relative;
-  border:1px solid transparent;
+  /* The border is always 2px so nothing shifts when a frame becomes current. */
+  border:2px solid transparent;
   border-radius:var(--r-sm);
   overflow:hidden;
   cursor:pointer;
@@ -180,10 +195,40 @@ button, select, input, textarea { font:inherit; color:inherit; }
   flex:0 0 auto;
   line-height:0;
 }
-.thumb img { width:100%; display:block; opacity:.82; }
-.thumb:hover img { opacity:1; }
-.thumb[aria-selected="true"] { border-color:var(--accent); }
+/* Frames you are not on sit back a little — enough that the current one leads,
+   not so much that you cannot scan the strip for what you are looking for. */
+.thumb img { width:100%; display:block; opacity:.7; }
+.thumb:hover img { opacity:.92; }
+
+.thumb[aria-selected="true"] {
+  border-color:var(--accent);
+  box-shadow:0 0 0 1px var(--accent), 0 0 12px rgba(124,156,255,.5);
+}
 .thumb[aria-selected="true"] img { opacity:1; }
+/* A solid bar down the edge: readable even over a bright or busy frame. */
+.thumb[aria-selected="true"]::before {
+  content:"";
+  position:absolute; left:0; top:0; bottom:0;
+  width:4px;
+  background:var(--accent);
+  z-index:2;
+}
+.thumb[aria-selected="true"] .thumb-idx {
+  background:var(--accent);
+  color:#0f1218;
+  font-weight:600;
+}
+
+/* Part of a multi-frame pick: tinted, and dimmer than the current frame. */
+.thumb[data-picked="true"] { border-color:rgba(124,156,255,.6); }
+.thumb[data-picked="true"] img { opacity:.9; }
+.thumb[data-picked="true"]::after {
+  content:"";
+  position:absolute; inset:0;
+  background:rgba(124,156,255,.24);
+  pointer-events:none;
+}
+.thumb[aria-selected="true"][data-picked="true"] { border-color:var(--accent); }
 
 .thumb-idx {
   position:absolute; left:0; bottom:0;
@@ -247,6 +292,44 @@ button, select, input, textarea { font:inherit; color:inherit; }
 .tool[aria-pressed="true"] { background:var(--accent); border-color:var(--accent); color:#0f1218; }
 .tool-pos[aria-pressed="true"] { background:var(--ok); border-color:var(--ok); }
 .tool-neg[aria-pressed="true"] { background:var(--danger); border-color:var(--danger); color:#fff; }
+
+kbd {
+  font-family:var(--font);
+  font-size:10px;
+  line-height:1;
+  padding:2px 4px;
+  border-radius:3px;
+  border:1px solid var(--line);
+  background:var(--ink-900);
+  color:var(--text-faint);
+  white-space:nowrap;
+}
+.tool kbd { margin-left:2px; }
+.tool[aria-pressed="true"] kbd { background:rgba(0,0,0,.18); border-color:transparent; color:inherit; opacity:.8; }
+.ghost kbd { margin-left:5px; }
+
+.sel-info {
+  font-size:11.5px;
+  color:var(--accent);
+  border:1px solid rgba(124,156,255,.35);
+  background:rgba(124,156,255,.1);
+  border-radius:999px;
+  padding:2px 10px;
+}
+
+.shortcuts { display:flex; flex-direction:column; gap:16px; }
+.shortcut-group h4 { font-size:11px; color:var(--text-dim); font-weight:600; margin-bottom:6px; }
+.shortcut {
+  display:grid;
+  grid-template-columns:215px 1fr;
+  gap:12px;
+  padding:3px 0;
+  font-size:12px;
+  align-items:baseline;
+}
+.shortcut + .shortcut { border-top:1px solid var(--line-soft); }
+.shortcut-keys { display:flex; gap:4px; flex-wrap:wrap; }
+.shortcut-keys kbd { font-size:11px; color:var(--text); }
 
 .ghost {
   background:transparent;
@@ -334,10 +417,63 @@ button, select, input, textarea { font:inherit; color:inherit; }
 
 .rule { height:1px; background:var(--line-soft); border:0; margin:2px 0; }
 
+/* ── Collapsible sections ─────────────────────────────────── */
+
+.disclosure {
+  border:1px solid var(--line-soft);
+  border-radius:var(--r-md);
+  background:var(--ink-800);
+}
+.disclosure[data-open="true"] { background:var(--ink-750); border-color:var(--line); }
+
+.disclosure-head {
+  width:100%;
+  display:flex; align-items:center; gap:8px;
+  padding:9px 11px;
+  background:none; border:none; cursor:pointer; text-align:left;
+  color:var(--text);
+  border-radius:var(--r-md);
+}
+.disclosure-head:hover { background:rgba(255,255,255,.03); }
+.disclosure-title { font-weight:500; font-size:13px; white-space:nowrap; }
+.disclosure-summary {
+  margin-left:auto;
+  font-size:11.5px;
+  color:var(--text-faint);
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  max-width:52%;
+}
+.disclosure-chevron {
+  color:var(--text-faint);
+  font-size:15px;
+  line-height:1;
+  transition:transform .12s ease;
+  width:8px;
+}
+.disclosure[data-open="true"] .disclosure-chevron { transform:rotate(90deg); color:var(--accent); }
+/* Once a section is open its controls say everything the summary did. */
+.disclosure[data-open="true"] .disclosure-summary { display:none; }
+
+.disclosure-body {
+  display:flex; flex-direction:column; gap:9px;
+  padding:2px 11px 11px 11px;
+}
+
 .field { display:flex; flex-direction:column; gap:4px; }
 .field > span { font-size:11.5px; color:var(--text-dim); }
 .field-row { display:flex; gap:8px; }
 .field-row > .field { flex:1; }
+
+input[type=range], input[type=checkbox] { accent-color:var(--accent); }
+input[type=range] {
+  width:100%;
+  height:18px;
+  background:transparent;
+  cursor:pointer;
+}
+input[type=checkbox] { width:14px; height:14px; cursor:pointer; }
 
 input[type=text], input[type=number], select, textarea {
   background:var(--ink-750);
